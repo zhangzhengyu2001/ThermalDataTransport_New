@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>质谱 EIC 可视化</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    h1 { margin-bottom: 10px; }
+    fieldset { margin-bottom: 12px; }
+    label { display: inline-block; width: 140px; }
+    input { margin: 2px 8px 2px 0; }
+    button { margin: 2px 8px 2px 0; }
+    #status { margin-top: 6px; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>质谱 EIC 可视化（m/z 范围）</h1>
+  <div id="ms-info" style="margin-bottom: 8px; color: #333; font-size: 14px;">
+    当前远程谱图: 未知
+  </div>
+
+  <fieldset>
+    <legend>m/z 曲线设置</legend>
+    <div style="margin-bottom: 8px;">
+      <button id="btn-add-line" type="button">新增一行</button>
+      <button id="btn-refresh" type="button">刷新已显示曲线</button>
+      <button id="btn-clear" type="button">清空全部曲线</button>
+    </div>
+    <div style="margin-bottom: 8px;">
+      <label style="width: 90px;">startTime:</label>
+      <input id="start-time" type="number" step="0.01" placeholder="默认 0" style="width: 120px;" />
+      <label style="width: 90px;">EndTime:</label>
+      <input id="end-time" type="number" step="0.01" placeholder="默认 0" style="width: 120px;" />
+      <span style="color: #666;">单位: min</span>
+    </div>
+    <div id="mz-lines"></div>
+    <div id="status"></div>
+  </fieldset>
+
+  <canvas id="mz-chart" height="140"></canvas>
+
+  <script>
+    const backendBase = "http://localhost:8000";
+
+    const elStatus = document.getElementById("status");
+    const elMsInfo = document.getElementById("ms-info");
+    const elLines = document.getElementById("mz-lines");
+    const elStartTime = document.getElementById("start-time");
+    const elEndTime = document.getElementById("end-time");
+
+    const ctx = document.getElementById("mz-chart").getContext("2d");
+    const chartData = {
+      // 使用独立数据集，每个数据集是一条 m/z 曲线，点为 {x: time, y: intensity}
+      datasets: [],
+    };
+
+    const colors = [
+      "rgb(75, 192, 192)",
+      "rgb(255, 99, 132)",
+      "rgb(54, 162, 235)",
+      "rgb(255, 159, 64)",
+      "rgb(153, 102, 255)",
+      "rgb(255, 205, 86)",
+    ];
+
+    // 保存所有行的状态
+    const lines = [];
+    let nextLineId = 1;
+    let currentEndTime = null; // 最近一次 RefreshViewOfFile 得到的 EndTime
+
+    const chart = new Chart(ctx, {
+      type: "line",
+      data: chartData,
+      options: {
+        animation: false,
+        scales: {
+          x: {
+            type: "linear",
+            title: { display: true, text: "时间 (min)" },
+          },
+          y: {
+            beginAtZero: true,
+            title: { display: true, text: "信号强度" },
+          },
+        },
+      },
+    });
+
+    // 为一行创建 DOM 和状态对象
+    function addLine() {
+      const id = nextLineId++;
+      const row = document.createElement("div");
+      row.className = "mz-line";
+      row.style.marginBottom = "4px";
+      row.innerHTML = `
+        <label style="width: 90px;">质荷比范围:</label>
+        <input type="text" class="mz-input" placeholder="例如 100-200" style="width: 120px;" />
+        <label style="margin-left: 8px;">
+          <input type="checkbox" class="mz-visible" /> 显示
+        </label>
+        <button type="button" class="mz-delete">删除</button>
+      `;
+      elLines.appendChild(row);
+
+      const inputEl = row.querySelector(".mz-input");
+      const checkboxEl = row.querySelector(".mz-visible");
+      const deleteBtnEl = row.querySelector(".mz-delete");
+
+      const line = {
+        id,
+        row,
+        inputEl,
+        checkboxEl,
+        deleteBtnEl,
+        dataset: null,
+        visible: false,
+      };
+      lines.push(line);
+
+      // 复选框控制显示 / 隐藏
+      checkboxEl.addEventListener("change", async () => {
+        const mz = inputEl.value.trim();
+        if (checkboxEl.checked && !mz) {
+          alert("请输入该行的质荷比范围，例如 100-200");
+          checkboxEl.checked = false;
+          return;
+        }
+
+        if (!checkboxEl.checked) {
+          // 取消显示：先从图上移除该数据集
+          removeDatasetForLine(line);
+          line.visible = false;
+        } else {
+          line.visible = true;
+        }
+
+        // 增加或取消显示前，统一刷新一次 MS（RefreshViewOfFile），
+        // 并在必要时（或直接）更新所有已显示的 EIC
+        await refreshMsAndUpdateAllVisible();
+      });
+
+      // 删除按钮：删除该行并移除图中曲线
+      deleteBtnEl.addEventListener("click", () => {
+        removeDatasetForLine(line);
+        line.visible = false;
+        row.remove();
+        const idx = lines.indexOf(line);
+        if (idx >= 0) lines.splice(idx, 1);
+        chart.update("none");
+      });
+    }
+
+    function removeDatasetForLine(line) {
+      if (!line.dataset) return;
+      const idx = chartData.datasets.indexOf(line.dataset);
+      if (idx >= 0) {
+        chartData.datasets.splice(idx, 1);
+      }
+      line.dataset = null;
+    }
+
+    function getTimeRange() {
+      let startTime = parseFloat(elStartTime.value);
+      let endTime = parseFloat(elEndTime.value);
+      if (!Number.isFinite(startTime)) startTime = 0;
+      if (!Number.isFinite(endTime)) endTime = 0;
+      if (startTime < 0) startTime = 0;
+      if (endTime < 0) endTime = 0;
+      return { startTime, endTime };
+    }
+
+    async function fetchEicForLine(line, range) {
+      if (!line.visible) return;
+      const mz = line.inputEl.value.trim();
+      if (!mz) return;
+      const startTime = range ? range.startTime : 0;
+      const endTime = range ? range.endTime : 0;
+
+      try {
+        const resp = await fetch(backendBase + "/api/ms-chro-lite", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mass_range: mz, start_time: startTime, end_time: endTime }),
+        });
+        if (!resp.ok) {
+          throw new Error("HTTP " + resp.status);
+        }
+        const data = await resp.json();
+        if (!data.ok) {
+          console.warn("m/z", mz, "请求失败:", data.message || data.error || "请求失败");
+          elStatus.textContent = `m/z ${mz} 请求失败: ${data.message || data.error || "请求失败"}`;
+          return;
+        }
+
+        const time = data.time || [];
+        const intensity = data.intensity || [];
+        if (!Array.isArray(time) || !Array.isArray(intensity) || time.length === 0) {
+          elStatus.textContent = `m/z ${mz} 无数据返回，请检查质荷比范围`;
+          return;
+        }
+
+        const points = time.map((t, i) => ({ x: t, y: intensity[i] }));
+        if (!line.dataset) {
+          const color = colors[chartData.datasets.length % colors.length];
+          line.dataset = {
+            label: `m/z ${mz}`,
+            data: points,
+            borderColor: color,
+            borderWidth: 1,
+            fill: false,
+          };
+          chartData.datasets.push(line.dataset);
+        } else {
+          line.dataset.data = points;
+          line.dataset.label = `m/z ${mz}`;
+        }
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = `m/z ${mz} 调用 /api/ms-chro-lite 失败: ${e}`;
+      }
+    }
+
+    async function updateAllVisibleLines(range) {
+      const visibleLines = lines.filter((l) => l.visible);
+      if (visibleLines.length === 0) {
+        chart.update("none");
+        return;
+      }
+      await Promise.all(visibleLines.map((l) => fetchEicForLine(l, range)));
+      chart.update("none");
+    }
+
+    async function refreshMsAndUpdateAllVisible() {
+      elStatus.textContent = "正在刷新 MS 数据...";
+      try {
+        const resp = await fetch(backendBase + "/api/ms-refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        if (!resp.ok) {
+          throw new Error("HTTP " + resp.status);
+        }
+        const data = await resp.json();
+        if (!data.ok) {
+          elStatus.textContent = `刷新 MS 数据失败: ${data.error || "未知错误"}`;
+          return;
+        }
+
+        const newEnd = parseFloat(data.ms_end_time);
+        const lengthChanged =
+          Number.isFinite(newEnd) && currentEndTime !== null && newEnd > currentEndTime;
+        currentEndTime = Number.isFinite(newEnd) ? newEnd : currentEndTime;
+
+        const range = getTimeRange();
+        // 无论长度是否变化，都统一刷新所有已显示 EIC，
+        // 这样在采集中 EndTime 变长时会自动补齐所有曲线
+        await updateAllVisibleLines(range);
+
+        elStatus.textContent = `已刷新 MS 数据，EndTime = ${data.ms_end_time}`;
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "调用 /api/ms-refresh 失败: " + e;
+      }
+    }
+
+    document.getElementById("btn-add-line").onclick = () => {
+      addLine();
+    };
+
+    document.getElementById("btn-refresh").onclick = async () => {
+      await refreshMsAndUpdateAllVisible();
+    };
+
+    document.getElementById("btn-clear").onclick = () => {
+      lines.forEach((line) => {
+        line.visible = false;
+        if (line.checkboxEl) line.checkboxEl.checked = false;
+        removeDatasetForLine(line);
+      });
+      chartData.datasets.length = 0;
+      chart.update("none");
+      elStatus.textContent = "已清空全部曲线";
+    };
+
+    async function initMsInfo() {
+      try {
+        const resp = await fetch(backendBase + "/api/state");
+        if (!resp.ok) return;
+        const st = await resp.json();
+        const ms = st.ms || {};
+        if (ms.open && ms.raw_path) {
+          const rawPath = ms.raw_path;
+          const parts = String(rawPath).split(/[\\/]/);
+          const name = parts[parts.length - 1] || rawPath;
+          elMsInfo.textContent = `当前远程谱图: ${name}`;
+        } else {
+          elMsInfo.textContent = "当前远程谱图: 未打开";
+        }
+      } catch (e) {
+        console.warn("获取 MS 状态失败", e);
+      }
+    }
+
+    // 默认先增加一行，方便直接输入，并初始化远程谱图信息
+    addLine();
+    initMsInfo();
+  </script>
+</body>
+</html>

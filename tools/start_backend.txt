@@ -1,0 +1,5 @@
+uvicorn tools.backend_server:app --reload --host 0.0.0.0 --port 8000
+
+01 10 00 10 00 02 04 00 01 24 F8 B9 E1
+D:\SUNSHUANG\2025\202512\20251225\test.raw
+D:\SUNSHUANG\2025\202512\20251226\pressure_huanjiwan.raw

@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>气压 PID 控制监控</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/luxon@3/build/global/luxon.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1/dist/chartjs-adapter-luxon.umd.min.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    h1 { margin-bottom: 10px; }
+    fieldset { margin-bottom: 12px; }
+    label { display: inline-block; width: 140px; }
+    input { margin: 2px 8px 2px 0; }
+    button { margin: 2px 8px 2px 0; }
+    #status { margin-top: 6px; color: #555; }
+    .ms-picker { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.35); z-index: 1000; }
+    .ms-picker.show { display: flex; }
+    .ms-picker-panel { width: 760px; max-width: 95vw; background: #fff; border: 1px solid #ccc; border-radius: 6px; padding: 12px; box-shadow: 0 6px 18px rgba(0,0,0,0.2); }
+    .ms-picker-row { display: flex; gap: 12px; }
+    .ms-picker-col { flex: 1; border: 1px solid #ddd; border-radius: 4px; min-height: 220px; max-height: 320px; overflow: auto; }
+    .ms-picker-col h4 { margin: 6px 8px; font-size: 14px; }
+    .ms-picker-list { list-style: none; padding: 0 8px 8px; margin: 0; }
+    .ms-picker-list li { padding: 4px 6px; cursor: pointer; border-radius: 3px; }
+    .ms-picker-list li:hover { background: #f1f1f1; }
+    .ms-picker-list li.selected { background: #dbe9ff; }
+    .ms-path { font-family: monospace; font-size: 12px; color: #333; word-break: break-all; padding: 4px 6px; border: 1px solid #ddd; border-radius: 4px; background: #fafafa; }
+  </style>
+</head>
+<body>
+  <h1>气压 PID 控制监控</h1>
+
+  <fieldset>
+    <legend>串口配置</legend>
+    <div>
+      <strong>STM32 (Modbus)</strong><br />
+      <label>串口号:</label>
+      <select id="stm32-port"></select>
+      <label>波特率:</label><input id="stm32-baud" type="number" value="115200" />
+      <label>地址:</label><input id="stm32-addr" type="number" value="1" />
+      <button id="btn-open-stm32">打开 STM32 串口</button>
+      <button id="btn-close-stm32">关闭</button>
+    </div>
+    <div>
+      <strong>数字电源</strong><br />
+      <label>串口号:</label>
+      <select id="power-port"></select>
+      <button id="btn-open-power">打开电源串口</button>
+      <button id="btn-close-power">关闭</button>
+    </div>
+    <div>
+      <strong>电流监控</strong><br />
+      <label>串口号:</label>
+      <select id="current-port"></select>
+      <span>波特率: 9600 (固定)</span>
+      <button id="btn-open-current">打开电流串口</button>
+      <button id="btn-close-current">关闭</button>
+    </div>
+    <div>
+      <button id="btn-refresh-ports">刷新串口列表</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>控制参数</legend>
+    <div>
+      <label>目标气压 (Pa):</label>
+      <input id="target" type="number" step="1" value="50000" />
+      <button id="btn-set-target">设置</button>
+      <span>当前目标: <span id="target-display">--</span> Pa</span>
+    </div>
+    <div>
+      <label>采样/控制周期 (s):</label>
+      <input id="period" type="number" step="0.01" value="0.1" />
+      <button id="btn-set-period">设置周期</button>
+    </div>
+    <div>
+      <label>历史窗口 (s):</label>
+      <input id="history-window" type="number" step="1" value="60" />
+      <button id="btn-set-history-window">设置窗口</button>
+    </div>
+    <div>
+      <button id="btn-start">开始控制</button>
+      <button id="btn-stop">停止控制</button>
+      <button id="btn-monitor-on">仅监测模式(start_pid=0)</button>
+      <button id="btn-monitor-off">控制模式(start_pid>0)</button>
+      <button id="btn-save-data">保存数据</button>
+      <button id="btn-reload-pid">重新加载PID并写入STM32</button>
+    </div>
+    <div id="status"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>电源控制</legend>
+    <div>
+      <label>目标电压 (V):</label>
+      <input id="power-voltage" type="number" step="0.1" value="0" />
+      <button id="btn-set-power-voltage">设置电压</button>
+      <span>当前设定: <span id="power-voltage-display">--</span> V</span>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>质谱日志</legend>
+    <div>
+      <label>MS 服务器 IP:</label>
+      <input id="ms-server" type="text" value="192.168.31.99" />
+    </div>
+    <div>
+      <label>.raw 文件路径:</label>
+      <input id="ms-raw-path" type="text" style="width: 420px" />
+      <button id="btn-ms-browse">浏览选择</button>
+    </div>
+    <div>
+      <button id="btn-ms-open">打开远程文件</button>
+      <button id="btn-ms-close">关闭远程文件</button>
+      <button id="btn-ms-log">刷新质谱并写入日志</button>
+      <button id="btn-open-mz-page">打开质谱EIC页面</button>
+    </div>
+  </fieldset>
+
+  <div id="ms-picker" class="ms-picker">
+    <div class="ms-picker-panel">
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+        <strong style="min-width: 90px;">选择 .raw</strong>
+        <label>根目录:</label>
+        <select id="ms-root"></select>
+        <button id="btn-ms-up">上一级</button>
+        <button id="btn-ms-refresh">刷新</button>
+      </div>
+      <div style="margin-bottom: 8px;">
+        <div>当前路径:</div>
+        <div id="ms-path" class="ms-path">--</div>
+      </div>
+      <div class="ms-picker-row">
+        <div class="ms-picker-col">
+          <h4>目录</h4>
+          <ul id="ms-dirs" class="ms-picker-list"></ul>
+        </div>
+        <div class="ms-picker-col">
+          <h4>文件 (.raw)</h4>
+          <ul id="ms-files" class="ms-picker-list"></ul>
+        </div>
+      </div>
+      <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
+        <span>已选:</span>
+        <span id="ms-selected" class="ms-path" style="flex: 1;">--</span>
+        <button id="btn-ms-select">确定</button>
+        <button id="btn-ms-cancel">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <canvas id="pressure-chart" height="120"></canvas>
+
+  <fieldset>
+    <legend>电流监控</legend>
+    <div>
+      <button id="btn-save-current">保存电流数据</button>
+      <span style="margin-left: 16px; color: #666;">单位: uA</span>
+    </div>
+    <canvas id="current-chart" height="120"></canvas>
+  </fieldset>
+
+  <script>
+    const backendBase = "http://localhost:8000";
+    const wsUrl = "ws://localhost:8000/ws/pressure";
+
+    const elTargetDisplay = document.getElementById("target-display");
+    const elTarget = document.getElementById("target");
+    const elPeriod = document.getElementById("period");
+    const elHistoryWindow = document.getElementById("history-window");
+    const elStatus = document.getElementById("status");
+
+    const elStm32Port = document.getElementById("stm32-port");
+    const elStm32Baud = document.getElementById("stm32-baud");
+    const elStm32Addr = document.getElementById("stm32-addr");
+
+    const elPowerPort = document.getElementById("power-port");
+    const elPowerVoltage = document.getElementById("power-voltage");
+    const elPowerVoltageDisplay = document.getElementById("power-voltage-display");
+
+    const elMsServer = document.getElementById("ms-server");
+    const elMsRawPath = document.getElementById("ms-raw-path");
+    const elMsBrowse = document.getElementById("btn-ms-browse");
+    const elMsPicker = document.getElementById("ms-picker");
+    const elMsRoot = document.getElementById("ms-root");
+    const elMsPath = document.getElementById("ms-path");
+    const elMsDirs = document.getElementById("ms-dirs");
+    const elMsFiles = document.getElementById("ms-files");
+    const elMsSelected = document.getElementById("ms-selected");
+    const elMsUp = document.getElementById("btn-ms-up");
+    const elMsRefresh = document.getElementById("btn-ms-refresh");
+    const elMsSelect = document.getElementById("btn-ms-select");
+    const elMsCancel = document.getElementById("btn-ms-cancel");
+
+    const elCurrentPort = document.getElementById("current-port");
+
+    const maxPoints = 300;
+
+    let msCurrentPath = "";
+    let msParentPath = "";
+    let msSelectedPath = "";
+    let msLastFiles = [];
+
+    const ctxChart = document.getElementById("pressure-chart").getContext("2d");
+    const chartData = {
+      labels: [],
+      datasets: [
+        {
+          label: "滤波气压 (Pa)",
+          data: [],
+          borderColor: "rgb(75, 192, 192)",
+          borderWidth: 1,
+          fill: false,
+          yAxisID: "y",
+        },
+        {
+          label: "目标气压 (Pa)",
+          data: [],
+          borderColor: "rgb(255, 99, 132)",
+          borderWidth: 1,
+          borderDash: [5, 5],
+          fill: false,
+          yAxisID: "y",
+        },
+        {
+          label: "MFC 开度 × 100000",
+          data: [],
+          borderColor: "rgb(54, 162, 235)",
+          borderWidth: 1,
+          borderDash: [2, 2],
+          fill: false,
+          yAxisID: "y1",
+        },
+      ],
+    };
+
+    const chart = new Chart(ctxChart, {
+      type: "line",
+      data: chartData,
+      options: {
+        animation: false,
+        scales: {
+          x: {
+            type: "time",
+            time: {
+              unit: "second",
+              tooltipFormat: "HH:mm:ss",
+            },
+          },
+          y: {
+            beginAtZero: true,
+            title: {
+              display: true,
+              text: "气压 (Pa)",
+            },
+          },
+          y1: {
+            position: "right",
+            beginAtZero: true,
+            title: {
+              display: true,
+              text: "MFC 开度 × 100000",
+            },
+            grid: {
+              drawOnChartArea: false,
+            },
+          },
+        },
+      },
+    });
+
+    const ctxCurrentChart = document.getElementById("current-chart").getContext("2d");
+    const currentChartData = {
+      labels: [],
+      datasets: [
+        {
+          label: "电流 (uA)",
+          data: [],
+          borderColor: "rgb(255, 159, 64)",
+          borderWidth: 1,
+          fill: false,
+        },
+      ],
+    };
+
+    const currentChart = new Chart(ctxCurrentChart, {
+      type: "line",
+      data: currentChartData,
+      options: {
+        animation: false,
+        scales: {
+          x: {
+            type: "time",
+            time: {
+              unit: "second",
+              tooltipFormat: "HH:mm:ss",
+            },
+          },
+          y: {
+            beginAtZero: true,
+            title: {
+              display: true,
+              text: "电流 (uA)",
+            },
+          },
+        },
+      },
+    });
+
+    async function apiPost(path, body) {
+      const resp = await fetch(backendBase + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      if (!resp.ok) {
+        throw new Error("HTTP " + resp.status);
+      }
+      return resp.json();
+    }
+
+    async function apiGet(path) {
+      const resp = await fetch(backendBase + path);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    }
+
+    function msShowPicker(show) {
+      if (show) {
+        elMsPicker.classList.add("show");
+      } else {
+        elMsPicker.classList.remove("show");
+      }
+    }
+
+    function msUpdateSelected() {
+      elMsSelected.textContent = msSelectedPath || "--";
+    }
+
+    function msRenderFiles(files) {
+      elMsFiles.innerHTML = "";
+      files.forEach((f) => {
+        const li = document.createElement("li");
+        li.textContent = f.name;
+        li.dataset.path = f.path;
+        if (f.path === msSelectedPath) li.classList.add("selected");
+        li.onclick = () => {
+          msSelectedPath = f.path;
+          msUpdateSelected();
+          msRenderFiles(files);
+        };
+        li.ondblclick = () => {
+          msSelectedPath = f.path;
+          msUpdateSelected();
+          elMsRawPath.value = msSelectedPath;
+          msShowPicker(false);
+        };
+        elMsFiles.appendChild(li);
+      });
+    }
+
+    function msRenderDirs(dirs) {
+      elMsDirs.innerHTML = "";
+      dirs.forEach((d) => {
+        const li = document.createElement("li");
+        li.textContent = d.name;
+        li.dataset.path = d.path;
+        li.onclick = () => {
+          msLoadList(d.path);
+        };
+        elMsDirs.appendChild(li);
+      });
+    }
+
+    async function msLoadRoots(server) {
+      const r = await apiPost("/api/ms-fs-roots", { server });
+      if (!r.ok) throw new Error(r.error || "获取根目录失败");
+      return r.roots || [];
+    }
+
+    async function msLoadList(path) {
+      const server = elMsServer.value.trim();
+      const r = await apiPost("/api/ms-fs-list", { server, path });
+      if (!r.ok) throw new Error(r.error || "获取目录失败");
+      msCurrentPath = r.path || path;
+      msParentPath = r.parent || "";
+      elMsPath.textContent = msCurrentPath;
+      msSelectedPath = "";
+      msUpdateSelected();
+      msRenderDirs(r.dirs || []);
+      msLastFiles = r.files || [];
+      msRenderFiles(msLastFiles);
+    }
+
+    async function loadPorts() {
+      try {
+        const portsResp = await apiGet("/api/ports");
+        const ports = portsResp.ports || [];
+        const fillSelect = (sel, ports) => {
+          const prev = sel.value;
+          sel.innerHTML = "";
+          ports.forEach((p) => {
+            const opt = document.createElement("option");
+            opt.value = p.device;
+            opt.textContent = `${p.device} (${p.description || ""})`;
+            sel.appendChild(opt);
+          });
+          // 如果之前选中的端口还在列表中，尽量保持选择
+          if (prev) {
+            const hasPrev = ports.some((p) => p.device === prev);
+            if (hasPrev) sel.value = prev;
+          }
+        };
+        fillSelect(elStm32Port, ports);
+        fillSelect(elPowerPort, ports);
+        fillSelect(elCurrentPort, ports);
+      } catch (e) {
+        console.warn("获取串口列表失败", e);
+      }
+    }
+
+    async function initFromBackend() {
+      try {
+        await loadPorts();
+        const st = await apiGet("/api/state");
+        elTarget.value = st.target.toFixed(1);
+        elTargetDisplay.textContent = st.target.toFixed(1);
+        elPeriod.value = st.period.toFixed(3);
+        elHistoryWindow.value = st.history_window.toFixed(0);
+        if (st.stm32.port) elStm32Port.value = st.stm32.port;
+        elStm32Baud.value = st.stm32.baud;
+        elStm32Addr.value = st.stm32.addr;
+        if (st.power) {
+          if (st.power.port) elPowerPort.value = st.power.port;
+          if (typeof st.power.current_voltage === "number") {
+            elPowerVoltage.value = st.power.current_voltage.toFixed(2);
+            elPowerVoltageDisplay.textContent = st.power.current_voltage.toFixed(2);
+          }
+        }
+        if (st.current && st.current.port) {
+          elCurrentPort.value = st.current.port;
+        }
+        if (st.monitor_only) {
+          elStatus.textContent = "当前为仅监测模式 (start_pid=0)";
+        } else {
+          elStatus.textContent = "当前为控制模式 (start_pid>0)";
+        }
+      } catch (e) {
+        console.warn("获取初始状态失败", e);
+      }
+    }
+
+    document.getElementById("btn-set-target").onclick = async () => {
+      const v = parseFloat(elTarget.value);
+      if (isNaN(v)) return alert("请输入合法目标气压");
+      try {
+        elStatus.textContent = "设置目标中...";
+        const r = await apiPost("/api/target", { target: v });
+        elTargetDisplay.textContent = r.target.toFixed(1);
+        elStatus.textContent = "目标已更新，并已记录日志";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "设置目标失败";
+      }
+    };
+
+    document.getElementById("btn-set-period").onclick = async () => {
+      const p = parseFloat(elPeriod.value);
+      if (!(p > 0)) return alert("周期必须 > 0");
+      try {
+        elStatus.textContent = "设置周期中...";
+        const r = await apiPost("/api/period", { period: p });
+        elPeriod.value = r.period.toFixed(3);
+        elStatus.textContent = "周期已更新";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "设置周期失败";
+      }
+    };
+
+    document.getElementById("btn-set-history-window").onclick = async () => {
+      const sec = parseFloat(elHistoryWindow.value);
+      if (!(sec > 0)) return alert("历史窗口必须 > 0");
+      try {
+        elStatus.textContent = "设置历史窗口中...";
+        const r = await apiPost("/api/history-window", { seconds: sec });
+        elHistoryWindow.value = r.history_window.toFixed(0);
+        elStatus.textContent = "历史窗口已更新";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "设置历史窗口失败";
+      }
+    };
+
+    document.getElementById("btn-open-stm32").onclick = async () => {
+      const port = elStm32Port.value.trim();
+      const baudrate = parseInt(elStm32Baud.value, 10) || 115200;
+      const addr = parseInt(elStm32Addr.value, 10) || 1;
+      if (!port) return alert("请输入 STM32 串口号");
+      try {
+        elStatus.textContent = "打开 STM32 串口...";
+        await apiPost("/api/open-stm32", { port, baudrate, addr });
+        elStatus.textContent = "STM32 串口已打开";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "打开 STM32 串口失败";
+      }
+    };
+
+    document.getElementById("btn-close-stm32").onclick = async () => {
+      try {
+        elStatus.textContent = "关闭 STM32 串口...";
+        await apiPost("/api/close-stm32", {});
+        elStatus.textContent = "STM32 串口已关闭";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "关闭 STM32 串口失败";
+      }
+    };
+
+    document.getElementById("btn-reload-pid").onclick = async () => {
+      try {
+        elStatus.textContent = "重新加载PID参数并写入STM32...";
+        await apiPost("/api/reload-pid", {});
+        elStatus.textContent = "PID参数已从配置文件重新写入STM32";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "重新加载PID或写入STM32失败";
+      }
+    };
+
+      document.getElementById("btn-open-current").onclick = async () => {
+        const port = elCurrentPort.value.trim();
+        if (!port) return alert("请选择电流串口号");
+        try {
+          elStatus.textContent = "打开电流串口...";
+          await apiPost("/api/open-current", { port });
+          elStatus.textContent = "电流串口已打开 (9600 波特率)";
+        } catch (e) {
+          console.error(e);
+          elStatus.textContent = "打开电流串口失败";
+        }
+      };
+
+      document.getElementById("btn-close-current").onclick = async () => {
+        try {
+          elStatus.textContent = "关闭电流串口...";
+          await apiPost("/api/close-current", {});
+          elStatus.textContent = "电流串口已关闭";
+        } catch (e) {
+          console.error(e);
+          elStatus.textContent = "关闭电流串口失败";
+        }
+      };
+
+      document.getElementById("btn-open-power").onclick = async () => {
+        const port = elPowerPort.value.trim();
+        if (!port) return alert("请选择电源串口号");
+        try {
+          elStatus.textContent = "打开电源串口...";
+          await apiPost("/api/open-power", { port, baudrate: 0, addr: 0 });
+          elStatus.textContent = "电源串口已打开";
+        } catch (e) {
+          console.error(e);
+          elStatus.textContent = "打开电源串口失败";
+        }
+      };
+
+      document.getElementById("btn-close-power").onclick = async () => {
+        try {
+          elStatus.textContent = "关闭电源串口...";
+          await apiPost("/api/close-power", {});
+          elStatus.textContent = "电源串口已关闭";
+        } catch (e) {
+          console.error(e);
+          elStatus.textContent = "关闭电源串口失败";
+        }
+      };
+
+    document.getElementById("btn-refresh-ports").onclick = async () => {
+      elStatus.textContent = "刷新串口列表...";
+      await loadPorts();
+      elStatus.textContent = "串口列表已刷新";
+    };
+
+    document.getElementById("btn-start").onclick = async () => {
+      try {
+        // 启动控制前清空图表数据
+        chartData.labels.length = 0;
+        chartData.datasets[0].data.length = 0;
+        chartData.datasets[1].data.length = 0;
+        chartData.datasets[2].data.length = 0;
+        chart.update("none");
+
+        elStatus.textContent = "启动控制...";
+        await apiPost("/api/start", {});
+        elStatus.textContent = "控制已启动";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "启动控制失败（请确认串口已打开）";
+      }
+    };
+
+    document.getElementById("btn-stop").onclick = async () => {
+      try {
+        elStatus.textContent = "停止控制...";
+        await apiPost("/api/stop", {});
+        elStatus.textContent = "控制已停止";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "停止控制失败";
+      }
+    };
+
+    document.getElementById("btn-monitor-on").onclick = async () => {
+      try {
+        elStatus.textContent = "切换至仅监测模式 (start_pid=0)...";
+        await apiPost("/api/monitor-on", {});
+        elStatus.textContent = "已启用仅监测模式 (start_pid=0)";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "切换仅监测模式失败";
+      }
+    };
+
+    document.getElementById("btn-monitor-off").onclick = async () => {
+      try {
+        elStatus.textContent = "切换至控制模式 (start_pid>0)...";
+        await apiPost("/api/monitor-off", {});
+        elStatus.textContent = "已切换至控制模式 (start_pid>0)";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "关闭仅监测模式失败";
+      }
+    };
+
+    // 点击一次“保存数据”，将当前缓冲区写入 CSV 文件
+    document.getElementById("btn-save-data").onclick = async () => {
+      try {
+        elStatus.textContent = "正在保存当前历史数据...";
+        await apiPost("/api/save-data", {});
+        elStatus.textContent = "历史数据已保存到 data/pressure_*.csv";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "保存数据失败";
+      }
+    };
+
+    document.getElementById("btn-save-current").onclick = async () => {
+      try {
+        elStatus.textContent = "正在保存当前电流历史数据...";
+        const r = await apiPost("/api/save-current-data", {});
+        if (r.ok) {
+          elStatus.textContent = "电流历史数据已保存到 data/current_*.csv";
+        } else if (r.empty) {
+          elStatus.textContent = "当前电流历史缓冲区为空，未生成文件";
+        } else {
+          elStatus.textContent = "保存电流数据失败";
+        }
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "保存电流数据失败";
+      }
+    };
+
+    document.getElementById("btn-set-power-voltage").onclick = async () => {
+      const v = parseFloat(elPowerVoltage.value);
+      if (isNaN(v)) return alert("请输入合法的目标电压");
+      try {
+        elStatus.textContent = "设置电源电压中...";
+        const r = await apiPost("/api/power/voltage", { voltage: v });
+        elPowerVoltage.value = r.voltage.toFixed(2);
+        elPowerVoltageDisplay.textContent = r.voltage.toFixed(2);
+        elStatus.textContent = "电源电压已设置，并已记录日志";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "设置电源电压失败";
+      }
+    };
+
+    document.getElementById("btn-ms-open").onclick = async () => {
+      const server = elMsServer.value.trim();
+      const raw_path = elMsRawPath.value.trim();
+      if (!server) return alert("请输入 MS 服务器 IP 地址");
+      if (!raw_path) return alert("请输入 .raw 文件路径");
+      try {
+        elStatus.textContent = "打开远程 MS 文件...";
+        const r = await apiPost("/api/ms-open", { server, raw_path });
+        console.log("MS Open 返回:", r.open_result);
+        if (r.ok) {
+          elStatus.textContent = "远程文件打开成功";
+        } else {
+          elStatus.textContent = "远程文件打开失败，请查看控制台返回";
+        }
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "打开远程文件失败";
+      }
+    };
+
+    elMsBrowse.onclick = async () => {
+      const server = elMsServer.value.trim();
+      if (!server) return alert("请输入 MS 服务器 IP 地址");
+      try {
+        elStatus.textContent = "加载远程目录...";
+        const roots = await msLoadRoots(server);
+        elMsRoot.innerHTML = "";
+        roots.forEach((r) => {
+          const opt = document.createElement("option");
+          opt.value = r.path;
+          opt.textContent = r.path + (r.exists ? "" : " (不存在)");
+          elMsRoot.appendChild(opt);
+        });
+        if (roots.length === 0) {
+          elStatus.textContent = "未配置可用根目录";
+          alert("未配置可用根目录，请在 MSHTTPFastAPI 的 config.json 中设置 allowed_roots");
+          return;
+        }
+        msShowPicker(true);
+        elMsRoot.value = roots[0].path;
+        await msLoadList(elMsRoot.value);
+        elStatus.textContent = "";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "加载远程目录失败";
+      }
+    };
+
+    elMsRoot.onchange = async () => {
+      try {
+        await msLoadList(elMsRoot.value);
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "切换根目录失败";
+      }
+    };
+
+    elMsUp.onclick = async () => {
+      if (!msParentPath) return;
+      try {
+        await msLoadList(msParentPath);
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "返回上一级失败";
+      }
+    };
+
+    elMsRefresh.onclick = async () => {
+      if (!msCurrentPath) return;
+      try {
+        await msLoadList(msCurrentPath);
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "刷新目录失败";
+      }
+    };
+
+    elMsCancel.onclick = () => {
+      msShowPicker(false);
+    };
+
+    elMsSelect.onclick = () => {
+      if (!msSelectedPath) return alert("请选择一个 .raw 文件");
+      elMsRawPath.value = msSelectedPath;
+      msShowPicker(false);
+    };
+
+    document.getElementById("btn-ms-close").onclick = async () => {
+      try {
+        elStatus.textContent = "关闭远程 MS 文件...";
+        await apiPost("/api/ms-close", {});
+        elStatus.textContent = "远程文件已关闭";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "关闭远程文件失败";
+      }
+    };
+
+    document.getElementById("btn-ms-log").onclick = async () => {
+      const server = elMsServer.value.trim();
+      const raw_path = elMsRawPath.value.trim();
+      if (!server) return alert("请输入 MS 服务器 IP 地址");
+      if (!raw_path) return alert("请输入 .raw 文件路径");
+      try {
+        elStatus.textContent = "调用 MS 服务并写入日志...";
+        const r = await apiPost("/api/ms-log", { server, raw_path });
+        elStatus.textContent = `已写入日志，质谱最新时间: ${r.ms_end_time}`;
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "调用 MS 服务或写入日志失败";
+      }
+    };
+
+    document.getElementById("btn-open-mz-page").onclick = () => {
+      // 打开新的 EIC 可视化页面
+      window.open("mz_chro.html", "_blank");
+    };
+
+    function connectWs() {
+      const ws = new WebSocket(wsUrl);
+      ws.onopen = () => console.log("WS 连接成功");
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          const t = new Date(msg.timestamp * 1000);
+          const filtered = msg.filtered_pressure;
+          const target = msg.target_pressure;
+          const opening = msg.flow_cmd * 100000; // 当前 MFC 指令开度，由 STM32 PID 输出，放大 100000 倍显示
+
+          chartData.labels.push(t);
+          chartData.datasets[0].data.push(filtered);
+          chartData.datasets[1].data.push(target);
+          chartData.datasets[2].data.push(opening);
+          if (chartData.labels.length > maxPoints) {
+            chartData.labels.shift();
+            chartData.datasets[0].data.shift();
+            chartData.datasets[1].data.shift();
+            chartData.datasets[2].data.shift();
+          }
+          chart.update("none");
+
+          // 电流监控：后端以 current_a (单位 A) 下发
+          if (typeof msg.current_a === "number") {
+            const current_uA = msg.current_a * 1e6;
+            currentChartData.labels.push(t);
+            currentChartData.datasets[0].data.push(current_uA);
+            if (currentChartData.labels.length > maxPoints) {
+              currentChartData.labels.shift();
+              currentChartData.datasets[0].data.shift();
+            }
+            currentChart.update("none");
+          }
+        } catch (e) {
+          console.error("解析 WS 消息失败", e);
+        }
+      };
+      ws.onclose = () => {
+        console.log("WS 断开，3 秒后重连");
+        setTimeout(connectWs, 3000);
+      };
+      ws.onerror = (e) => console.error("WS 错误", e);
+    }
+
+    initFromBackend();
+    connectWs();
+  </script>
+</body>
+</html>
