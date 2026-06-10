@@ -86,6 +86,18 @@ def init_logging(log_dir: str | None = None, level: int = _DEFAULT_LEVEL) -> Non
     err_handler.setFormatter(_LOG_FORMAT)
     root.addHandler(err_handler)
 
+    # ---- 抑制第三方库的冗余 DEBUG 日志 ----
+    _NOISY_LOGGERS = [
+        "asyncio",
+        "urllib3",
+        "websockets",
+        "serial",           # pyserial 在某些模式下也很吵
+        "matplotlib",
+        "PIL",
+    ]
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     _initialized = True
 
     # 写一条启动标记
