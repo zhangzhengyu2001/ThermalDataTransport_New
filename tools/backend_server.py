@@ -27,6 +27,11 @@ from pydantic import BaseModel
 
 from tools.modbus_host import ModbusPressureClient
 from modbus.digital_power import DigitalPowerController
+from tools.logger_config import get_logger, init_logging
+
+# ---- 日志系统初始化 ----
+init_logging()
+logger = get_logger(__name__)
 
 try:
     from serial.tools import list_ports
@@ -82,9 +87,9 @@ def load_config() -> Dict[str, Any]:
             if isinstance(user_cfg, dict):
                 _deep_update(cfg, user_cfg)
         except Exception as e:  # noqa: BLE001
-            print(f"[CFG] 加载配置失败，使用默认值: {e}")
+            logger.warning("加载配置失败，使用默认值: %s", e)
     else:
-        print(f"[CFG] 未找到配置文件 {_CONFIG_PATH}，使用默认配置")
+        logger.info("未找到配置文件 %s，使用默认配置", _CONFIG_PATH)
     return cfg
 
 
@@ -279,12 +284,12 @@ def _ms_log_current_if_open() -> str:
         try:
             ms_end_time = _ms_refresh_and_get_end_time_no_open(ctx.ms_server, ctx.ms_raw_path)
         except Exception as e:  # noqa: BLE001
-            print(f"[MSLOG] 刷新质谱失败: {e}")
+            logger.warning("刷新质谱失败: %s", e)
         try:
             last_spec_num = _ms_get_last_spectrum_number(ctx.ms_server)
             last_spec = str(last_spec_num)
         except Exception as e:  # noqa: BLE001
-            print(f"[MSLOG] 获取最新谱图号失败: {e}")
+            logger.warning("获取最新谱图号失败: %s", e)
     return _append_ms_log(
         server=server,
         raw_path=raw_path,
@@ -373,7 +378,10 @@ class ControlContext:
         if not self.stm32_port:
             raise RuntimeError("STM32 串口号未设置")
         if self._modbus_cli and self._modbus_cli._ser and self._modbus_cli._ser.is_open:
+            logger.info("STM32 串口 %s 已打开，跳过重复打开", self.stm32_port)
             return
+        logger.info("正在打开 STM32 串口: port=%s, baud=%d, addr=0x%02X",
+                     self.stm32_port, self.stm32_baud, self.stm32_addr)
         self._modbus_cli = ModbusPressureClient(
             port=self.stm32_port,
             baudrate=self.stm32_baud,
@@ -381,6 +389,7 @@ class ControlContext:
             device_addr=self.stm32_addr,
         )
         self._modbus_cli.open()
+        logger.info("STM32 串口 %s 打开成功", self.stm32_port)
 
     def close_stm32(self):
         if self._modbus_cli:
@@ -523,7 +532,7 @@ class ControlContext:
                 self._current_history = [item for item in self._current_history if item[0] >= cutoff]
             except Exception as e:
                 # 读取或解析失败时，仅打印日志并稍作等待，避免线程退出
-                print(f"[CURRENT] 读取或解析电流数据失败: {e}")
+                logger.warning("读取或解析电流数据失败: %s", e)
                 time.sleep(0.5)
 
     # ---- 数字电源串口 ----
@@ -573,7 +582,7 @@ class ControlContext:
         此时写出的就是“停止控制前 history_window 秒内”的数据。
         """
         if not self._history:
-            print("[CTRL] 当前历史缓冲区为空，未生成文件")
+            logger.info("当前历史缓冲区为空，未生成文件")
             return
 
         os.makedirs("data", exist_ok=True)
@@ -591,11 +600,13 @@ class ControlContext:
                 ])
                 for item in self._history:
                     writer.writerow(list(item))
-            print(f"[CTRL] 已将 {len(self._history)} 条数据保存到 {filename}")
+            logger.info("已将 %d 条数据保存到 %s", len(self._history), filename)
         except Exception as e:
-            print(f"[CTRL] 保存快照失败: {e}")
+            logger.error("保存快照失败: %s", e)
 
     def _loop(self):
+        logger.info("控制循环已启动 (period=%.2fs, window=%.0fs)", self.period, self.history_window)
+        last_health_log = time.time()
         while not self._stop_flag.is_set() and self._modbus_cli:
             t0 = time.time()
             try:
@@ -606,8 +617,22 @@ class ControlContext:
                 self.current_target = target
                 self.current_flow_cmd = flow_cmd
                 self.current_start_pid = start_pid
+
+                # 每 10 秒输出一次健康状态摘要
+                now = time.time()
+                if now - last_health_log > 10.0:
+                    logger.debug("控制循环健康: filtered=%.1f Pa, air=%d Pa, target=%.0f Pa, "
+                                 "flow=%.4f, pid=%d, 连续错误=%d",
+                                 filtered, air, target, flow_cmd, start_pid,
+                                 self._modbus_cli.consecutive_errors)
+                    last_health_log = now
+
             except Exception as e:
-                print(f"[CTRL] 读取气压失败: {e}")
+                cons_err = self._modbus_cli.consecutive_errors if self._modbus_cli else -1
+                logger.error("读取气压失败: %s | 连续错误=%d", e, cons_err)
+                # 连续错误过多时发出警告
+                if cons_err >= 3:
+                    logger.warning("STM32 通信连续失败 %d 次，请检查串口连接和 STM32 状态！", cons_err)
                 time.sleep(self.period)
                 continue
 
@@ -639,7 +664,7 @@ class ControlContext:
             try:
                 asyncio.run(self._broadcast())
             except Exception as e:  # noqa: BLE001
-                print(f"[WS] 广播线程发送数据失败: {e}")
+                logger.error("广播线程发送数据失败: %s", e)
 
             elapsed = time.time() - t0
             # 使用 period 作为默认广播间隔；若非常小则兜底为 10ms
@@ -651,11 +676,13 @@ class ControlContext:
     async def register_ws(self, ws: WebSocket):
         async with self._ws_lock:
             self._ws_clients.append(ws)
+            logger.info("WebSocket 客户端已连接 (当前共 %d 个)", len(self._ws_clients))
 
     async def unregister_ws(self, ws: WebSocket):
         async with self._ws_lock:
             if ws in self._ws_clients:
                 self._ws_clients.remove(ws)
+                logger.info("WebSocket 客户端已断开 (当前共 %d 个)", len(self._ws_clients))
 
     async def _broadcast(self):
         data = {
@@ -686,6 +713,9 @@ class ControlContext:
             for ws in dead:
                 if ws in self._ws_clients:
                     self._ws_clients.remove(ws)
+            if dead:
+                logger.info("已移除 %d 个断开的 WebSocket 客户端 (剩余 %d)",
+                           len(dead), len(self._ws_clients))
 
 
 ctx = ControlContext()
@@ -844,14 +874,14 @@ async def set_target(body: TargetBody):
     try:
         ctx._modbus_cli.write_target_pressure(t)
     except Exception as e:
-        print(f"[CTRL] 写入目标气压失败: {e}")
+        logger.error("写入目标气压失败: %s", e)
         return {"error": str(e)}
     ctx.current_target = t
     # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
     try:
         await asyncio.to_thread(_ms_log_current_if_open)
     except Exception as e:  # noqa: BLE001
-        print(f"[MSLOG] 记录日志失败(设置目标气压): {e}")
+        logger.warning("记录日志失败(设置目标气压): %s", e)
     return {"target": ctx.current_target}
 
 
@@ -913,6 +943,7 @@ async def set_history_window(body: HistoryWindowBody):
 
 @app.post("/api/open-stm32")
 async def api_open_stm32(body: ComConfigBody):
+    logger.info("API: 打开 STM32 串口 port=%s baud=%d addr=%s", body.port, body.baudrate, body.addr)
     ctx.stm32_port = body.port
     ctx.stm32_baud = body.baudrate
     if body.addr is not None:
@@ -974,7 +1005,7 @@ async def api_set_power_voltage(body: VoltageBody):
     try:
         await asyncio.to_thread(_ms_log_current_if_open)
     except Exception as e:  # noqa: BLE001
-        print(f"[MSLOG] 记录日志失败(设置目标电压): {e}")
+        logger.warning("记录日志失败(设置目标电压): %s", e)
     return {"voltage": ctx.current_voltage, "register": reg}
 
 
@@ -1012,7 +1043,7 @@ async def api_ms_log(body: MsLogBody):
         last_spec_num = await asyncio.to_thread(_ms_get_last_spectrum_number, server)
         last_spec = str(last_spec_num)
     except Exception as e:  # noqa: BLE001
-        print(f"[MSLOG] 获取最新谱图号失败(/api/ms-log): {e}")
+        logger.warning("获取最新谱图号失败(/api/ms-log): %s", e)
 
     log_path = _append_ms_log(
         server=server,
@@ -1114,7 +1145,7 @@ async def api_ms_close():
             payload: Dict[str, Any] = {"argsNames": [], "args": []}
             _ = await asyncio.to_thread(_ms_http_post, base_url, "Close", payload)
         except Exception as e:  # noqa: BLE001
-            print(f"[MS] 远程关闭文件失败: {e}")
+            logger.warning("远程关闭文件失败: %s", e)
     ctx.ms_server = None
     ctx.ms_raw_path = None
     ctx.ms_open = False
@@ -1259,6 +1290,7 @@ async def api_open_mfc(body: ComConfigBody):
 
 @app.post("/api/close-stm32")
 async def api_close_stm32():
+    logger.info("API: 关闭 STM32 串口 (port=%s)", ctx.stm32_port)
     ctx.close_stm32()
     return {"ok": True}
 
@@ -1271,13 +1303,14 @@ async def api_close_mfc():
 
 @app.post("/api/start")
 async def api_start():
+    logger.info("API: 开始控制 (start_pid=1)")
     # 切换 STM32 至控制模式: start_pid = 1
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     try:
         ctx._modbus_cli.write_start_pid(1)
     except Exception as e:
-        print(f"[CTRL] 写入 start_pid 失败: {e}")
+        logger.error("写入 start_pid=1 失败: %s", e)
         return {"ok": False, "error": str(e)}
     ctx.start_control()
     return {"ok": True}
@@ -1285,13 +1318,14 @@ async def api_start():
 
 @app.post("/api/stop")
 async def api_stop():
+    logger.info("API: 停止控制 (start_pid=0)")
     # 切换 STM32 至仅检测模式: start_pid = 0（并由固件侧关闭 MFC）
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     try:
         ctx._modbus_cli.write_start_pid(0)
     except Exception as e:
-        print(f"[CTRL] 写入 start_pid 失败: {e}")
+        logger.error("写入 start_pid=0 失败: %s", e)
         return {"ok": False, "error": str(e)}
     ctx.stop_control()
     return {"ok": True}
@@ -1312,7 +1346,7 @@ async def api_save_current_data():
     """
 
     if not ctx._current_history:
-        print("[CURRENT] 当前电流历史缓冲区为空，未生成文件")
+        logger.info("当前电流历史缓冲区为空，未生成文件")
         return {"ok": False, "empty": True}
 
     os.makedirs("data", exist_ok=True)
@@ -1331,10 +1365,10 @@ async def api_save_current_data():
                 t, cur_a = item
                 ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
                 writer.writerow([ts_str, cur_a, raw_name])
-        print(f"[CURRENT] 已将 {len(ctx._current_history)} 条电流数据保存到 {filename}")
+        logger.info("已将 %d 条电流数据保存到 %s", len(ctx._current_history), filename)
         return {"ok": True, "path": filename, "ms_raw_name": raw_name}
     except Exception as e:  # noqa: BLE001
-        print(f"[CURRENT] 保存电流数据失败: {e}")
+        logger.error("保存电流数据失败: %s", e)
         return {"ok": False, "error": str(e)}
 
 
@@ -1346,7 +1380,7 @@ async def api_monitor_on():
     try:
         ctx._modbus_cli.write_start_pid(0)
     except Exception as e:
-        print(f"STM32 写入 start_pid 失败: {e}")
+        logger.error("写入 start_pid=0 失败 (monitor-on): %s", e)
         return {"ok": False, "error": f"Failed to write start_pid to STM32: {e}"}
     ctx.current_start_pid = 0
     return {"monitor_only": True}
@@ -1360,10 +1394,43 @@ async def api_monitor_off():
     try:
         ctx._modbus_cli.write_start_pid(1)
     except Exception as e:
-        print(f"STM32 写入 start_pid 失败: {e}")
+        logger.error("写入 start_pid=1 失败 (monitor-off): %s", e)
         return {"ok": False, "error": f"Failed to write start_pid to STM32: {e}"}
     ctx.current_start_pid = 1
     return {"monitor_only": False}
+
+
+@app.get("/api/health")
+async def api_health():
+    """设备连接健康检查接口。
+
+    返回 STM32 通信状态、电流监控状态、电源连接状态等，
+    供前端判断通信是否正常。
+    """
+    health = {
+        "stm32": {
+            "port": ctx.stm32_port,
+            "open": bool(ctx._modbus_cli and ctx._modbus_cli._ser and ctx._modbus_cli._ser.is_open),
+            "healthy": ctx._modbus_cli.is_healthy() if ctx._modbus_cli else False,
+            "consecutive_errors": ctx._modbus_cli.consecutive_errors if ctx._modbus_cli else -1,
+        },
+        "power": {
+            "port": ctx.power_port,
+            "open": bool(ctx._power and ctx._power.ser and ctx._power.ser.is_open),
+        },
+        "current": {
+            "port": ctx.current_port,
+            "open": bool(ctx._current_ser and ctx._current_ser.is_open),
+        },
+        "ms": {
+            "server": ctx.ms_server,
+            "open": ctx.ms_open,
+        },
+    }
+    overall = health["stm32"]["open"]
+    logger.debug("健康检查: stm32=%s, power=%s, current=%s",
+                 health["stm32"]["healthy"], health["power"]["open"], health["current"]["open"])
+    return {"ok": overall, "health": health}
 
 
 @app.websocket("/ws/pressure")

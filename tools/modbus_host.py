@@ -30,6 +30,10 @@ from typing import Tuple, List, Optional
 
 import serial
 
+from tools.logger_config import get_logger
+
+logger = get_logger(__name__)
+
 
 # 寄存器映射
 REG_FILTER_PRESSURE_HI = 0x0000  # 0x0000~0x0001 float32（滤波气压）
@@ -53,18 +57,24 @@ class ModbusPressureClient:
     - 提供读取滤波气压/原始气压、设置目标气压的接口。
     """
 
-    def __init__(self, port: str, *, baudrate: int = 115200, timeout: float = 0.5, device_addr: int = 0x01):
+    def __init__(self, port: str, *, baudrate: int = 115200, timeout: float = 0.5,
+                 device_addr: int = 0x01, retries: int = 3):
         self.port_name = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.addr = device_addr
         self._ser: Optional[serial.Serial] = None
+        self._retries = max(1, retries)  # 默认重试 3 次
+        self._consecutive_errors: int = 0  # 连续错误计数，用于健康监测
 
     # -------------------- 公共接口 --------------------
     def open(self) -> None:
         """打开串口。"""
         if self._ser and self._ser.is_open:
+            logger.debug("串口 %s 已处于打开状态，跳过", self.port_name)
             return
+        logger.info("正在打开串口 %s (波特率=%d, 地址=0x%02X, 超时=%.2fs)",
+                     self.port_name, self.baudrate, self.addr, self.timeout)
         self._ser = serial.Serial(
             port=self.port_name,
             baudrate=self.baudrate,
@@ -73,12 +83,17 @@ class ModbusPressureClient:
             stopbits=serial.STOPBITS_ONE,
             timeout=self.timeout,
         )
+        logger.info("串口 %s 打开成功", self.port_name)
+        self._consecutive_errors = 0
 
     def close(self) -> None:
         """关闭串口。"""
         if self._ser:
             try:
                 self._ser.close()
+                logger.info("串口 %s 已关闭 (连续错误=%d)", self.port_name, self._consecutive_errors)
+            except Exception as e:
+                logger.warning("关闭串口 %s 时异常: %s", self.port_name, e)
             finally:
                 self._ser = None
 
@@ -89,11 +104,22 @@ class ModbusPressureClient:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
+    def is_healthy(self) -> bool:
+        """检查通信是否健康（连续错误数是否在可接受范围内）。"""
+        return self._consecutive_errors < 5
+
+    @property
+    def consecutive_errors(self) -> int:
+        """返回连续通信错误计数。"""
+        return self._consecutive_errors
+
     def read_pressures(self) -> Tuple[float, int]:
         """读取滤波气压（float32, Pa）与原始气压（uint32, Pa）。"""
+        logger.debug("读取气压寄存器 0x%04X~0x%04X", REG_FILTER_PRESSURE_HI, REG_FILTER_PRESSURE_HI + 3)
         regs = self.read_registers(REG_FILTER_PRESSURE_HI, 4)
         filtered = self._parse_be_f32_from_regs(regs[0], regs[1])
         air_u32 = self._parse_be_u32_from_regs(regs[2], regs[3])
+        logger.debug("气压读取结果: filtered=%.1f Pa, air=%d Pa", filtered, air_u32)
         return filtered, air_u32
 
     # --- 新接口：写目标气压（float 或 int），供后端调用 ---
@@ -161,27 +187,60 @@ class ModbusPressureClient:
         """一次性读取滤波气压、原始气压、目标气压、MFC 开度和 start_pid。
 
         返回: (filtered(float), air(uint32), target(float), flow_cmd(float), start_pid(int))
+
+        实现：将原先 4 次独立 Modbus 读合并为 2 次（每块 ≤20 寄存器，适配 STM32 固件限制）。
+        第 1 块: 0x0000~0x0013（20 寄存器，含 filtered / air / target）
+        第 2 块: 0x0020~0x0031（18 寄存器，含 start_pid / flow_cmd）
+        失败时自动回退到原始 4 段式读取。
         """
-        # 1) 读取滤波气压与原始气压: 0x0000..0x0003
-        regs = self.read_registers(REG_FILTER_PRESSURE_HI, 4)
-        filtered = self._parse_be_f32_from_regs(regs[0], regs[1])
-        air_u32 = self._parse_be_u32_from_regs(regs[2], regs[3])
-
-        # 2) 单独读取目标气压: 0x0010..0x0011
-        t_regs = self.read_registers(REG_TARGET_PRESSURE_HI, 2)
-        target_u32 = self._parse_be_u32_from_regs(t_regs[0], t_regs[1])
-        target = float(target_u32)
-
-        # 3) 读取 start_pid: 从 0x0020 开始连续取两个寄存器，第二个为 0x0021
-        s_regs = self.read_registers(REG_CTRL_UPDATE, 2)
-        start_pid = s_regs[1] & 0xFFFF
-
-        # 4) 读取 MFC 开度指令（0~1），映射在 0x0030~0x0031
         try:
-            flow_regs = self.read_registers(REG_FLOW_CMD_HI, 2)
-            flow_cmd = self._parse_be_f32_from_regs(flow_regs[0], flow_regs[1])
+            # ---- 第 1 块: 0x0000~0x0013 (20 寄存器) ----
+            # 0x0000~0x0001: filtered_pressure (float32)
+            # 0x0002~0x0003: air_pressure (uint32)
+            # 0x0004~0x000F: 空隙（STM32 返回 0）
+            # 0x0010~0x0011: target_pressure (uint32)
+            # 0x0012~0x0013: 空隙
+            regs1 = self.read_registers(REG_FILTER_PRESSURE_HI, 20)
+            filtered = self._parse_be_f32_from_regs(regs1[0], regs1[1])
+            air_u32 = self._parse_be_u32_from_regs(regs1[2], regs1[3])
+            target_u32 = self._parse_be_u32_from_regs(regs1[0x10], regs1[0x11])
+            target = float(target_u32)
+
+            # ---- 第 2 块: 0x0020~0x0031 (18 寄存器) ----
+            # 0x0020: ctrl_update (忽略)
+            # 0x0021: start_pid
+            # 0x0022~0x002F: 空隙
+            # 0x0030~0x0031: g_valve_flow_cmd (float32)
+            regs2 = self.read_registers(REG_CTRL_UPDATE, 18)
+            start_pid = regs2[1] & 0xFFFF  # regs2[0]=0x0020, regs2[1]=0x0021
+            flow_cmd = self._parse_be_f32_from_regs(regs2[0x10], regs2[0x11])
+
+            logger.debug("2块合并读取成功: filtered=%.1f, air=%d, target=%.0f, flow=%.4f, pid=%d",
+                         filtered, air_u32, target, flow_cmd, start_pid)
         except Exception:
-            flow_cmd = 0.0
+            logger.warning("合并读取失败，回退到分段读取")
+            # 回退到原有的分段读取
+            # 1) 读取滤波气压与原始气压: 0x0000..0x0003
+            regs = self.read_registers(REG_FILTER_PRESSURE_HI, 4)
+            filtered = self._parse_be_f32_from_regs(regs[0], regs[1])
+            air_u32 = self._parse_be_u32_from_regs(regs[2], regs[3])
+
+            # 2) 单独读取目标气压: 0x0010..0x0011
+            t_regs = self.read_registers(REG_TARGET_PRESSURE_HI, 2)
+            target_u32 = self._parse_be_u32_from_regs(t_regs[0], t_regs[1])
+            target = float(target_u32)
+
+            # 3) 读取 start_pid: 从 0x0020 开始连续取两个寄存器，第二个为 0x0021
+            s_regs = self.read_registers(REG_CTRL_UPDATE, 2)
+            start_pid = s_regs[1] & 0xFFFF
+
+            # 4) 读取 MFC 开度指令（0~1），映射在 0x0030~0x0031
+            try:
+                flow_regs = self.read_registers(REG_FLOW_CMD_HI, 2)
+                flow_cmd = self._parse_be_f32_from_regs(flow_regs[0], flow_regs[1])
+            except Exception:
+                flow_cmd = 0.0
+                logger.warning("读取 MFC 开度失败，使用默认值 0.0")
 
         return filtered, air_u32, target, flow_cmd, start_pid
 
@@ -284,23 +343,77 @@ class ModbusPressureClient:
         assert self._ser is not None
         return self._ser
 
-    def _send_and_recv_exact(self, req: bytes, expect_len: int) -> bytes:
-        ser = self._ensure_open()
-        ser.reset_input_buffer()
-        ser.write(req)
-        ser.flush()
+    def _send_and_recv_exact(self, req: bytes, expect_len: int, retries: int | None = None) -> bytes:
+        """发送 Modbus 请求并等待完整响应（含自动重试）。
 
-        deadline = time.time() + (ser.timeout or 1.0)
-        buf = bytearray()
-        while len(buf) < expect_len and time.time() < deadline:
-            chunk = ser.read(expect_len - len(buf))
-            if chunk:
-                buf.extend(chunk)
-            else:
-                time.sleep(0.005)
-        if len(buf) != expect_len:
-            raise TimeoutError(f"串口超时：期望 {expect_len} 字节，实际 {len(buf)} 字节")
-        return bytes(buf)
+        重要改进：
+        - 移除了每次发送前的 reset_input_buffer()，避免丢弃已到达的响应数据
+        - 发送前仅清空输入缓冲区中可能残留的旧数据
+        - 内置重试机制，应对偶发的通信超时
+        - 记录每次通信的详细日志
+
+        参数：
+            req: 完整的 Modbus RTU 请求帧
+            expect_len: 期望的响应帧总字节数
+            retries: 最大重试次数，None 则使用实例默认值
+        """
+        max_retries = retries if retries is not None else self._retries
+        ser = self._ensure_open()
+
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                # 仅清空可能残留的旧数据（而非每次无差别 reset）
+                if ser.in_waiting > 0:
+                    discarded = ser.read(ser.in_waiting)
+                    logger.debug("串口 %s 清空残留数据 %d 字节: %s",
+                                 self.port_name, len(discarded), discarded.hex()[:60])
+
+                ser.write(req)
+                ser.flush()
+
+                deadline = time.time() + (ser.timeout or 1.0)
+                buf = bytearray()
+                while len(buf) < expect_len and time.time() < deadline:
+                    chunk = ser.read(expect_len - len(buf))
+                    if chunk:
+                        buf.extend(chunk)
+                    else:
+                        time.sleep(0.002)  # 缩短轮询间隔，改善响应速度
+
+                if len(buf) != expect_len:
+                    raise TimeoutError(
+                        f"串口超时：期望 {expect_len} 字节，实际收到 {len(buf)} 字节"
+                        f" (尝试 {attempt + 1}/{max_retries})"
+                    )
+
+                # 成功则重置连续错误计数
+                self._consecutive_errors = 0
+                if attempt > 0:
+                    logger.info("串口 %s 在第 %d 次重试后成功 (请求 %s)",
+                                self.port_name, attempt + 1, req[:4].hex())
+                return bytes(buf)
+
+            except Exception as e:
+                last_exc = e
+                self._consecutive_errors += 1
+                logger.debug("串口 %s 通信失败 (尝试 %d/%d): %s",
+                             self.port_name, attempt + 1, max_retries, e)
+                if attempt < max_retries - 1:
+                    # 重试前等待一小段时间，让设备恢复
+                    time.sleep(0.05 * (attempt + 1))
+                    # 重试前清空缓冲区
+                    try:
+                        if ser.in_waiting > 0:
+                            ser.reset_input_buffer()
+                    except Exception:
+                        pass
+
+        # 所有重试均失败
+        logger.error("串口 %s 通信彻底失败 (%d/%d 次): %s | 连续错误=%d",
+                     self.port_name, max_retries, max_retries, last_exc,
+                     self._consecutive_errors)
+        raise last_exc  # type: ignore[misc]
 
     @staticmethod
     def _crc16_modbus(data: bytes) -> int:
