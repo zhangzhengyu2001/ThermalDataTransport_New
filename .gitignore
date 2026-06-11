@@ -25,3 +25,5 @@ Thumbs.db
 
 # Environment
 .env
+
+stm32_HAL_project_new/
