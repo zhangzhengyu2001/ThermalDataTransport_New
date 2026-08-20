@@ -55,6 +55,19 @@
     .conn-badge.online { background: #d1fae5; color: #047857; }
     .conn-badge.offline { background: #fee2e2; color: #b91c1c; }
 
+    .comm-alert {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 14px;
+    }
+    .comm-alert.error { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+    .comm-alert.warn { background: #fef3c7; color: #b45309; border: 1px solid #fde68a; }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
@@ -216,6 +229,23 @@
       margin: 0;
     }
     .eic-chip button:hover { color: var(--danger); }
+
+    .log-view {
+      background: #0f172a;
+      color: #cbd5e1;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      padding: 10px 12px;
+      border-radius: 8px;
+      max-height: 260px;
+      overflow: auto;
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-view .warn { color: #fbbf24; }
+    .log-view .error { color: #f87171; }
     .chart-hint {
       position: absolute;
       inset: 0;
@@ -303,6 +333,8 @@
       </div>
       <span class="conn-badge" id="conn-badge">连接中…</span>
     </header>
+
+    <div class="comm-alert" id="comm-alert" style="display:none;"></div>
 
     <div class="grid">
 
@@ -447,6 +479,21 @@
       </section>
 
     </div>
+
+    <section class="card" style="margin-top: 14px;">
+      <div class="card-title"><span class="icon">📋</span>最近日志</div>
+      <div class="row">
+        <label>级别</label>
+        <select id="log-level">
+          <option value="all" selected>全部</option>
+          <option value="warning">警告及以上</option>
+          <option value="error">仅错误</option>
+        </select>
+        <button class="btn" id="btn-log-refresh">刷新</button>
+        <span class="hint" id="log-info"></span>
+      </div>
+      <pre class="log-view" id="log-view"></pre>
+    </section>
   </div>
 
   <div id="ms-picker" class="ms-picker">
@@ -495,6 +542,26 @@
     function setConnBadge(text, state) {
       elConnBadge.textContent = text;
       elConnBadge.className = "conn-badge " + state;
+    }
+
+    function updateCommAlert(comm) {
+      const el = document.getElementById("comm-alert");
+      if (!comm) return;
+      if (!comm.open || comm.consecutive_errors < 0) {
+        el.style.display = "none";
+        return;
+      }
+      if (comm.consecutive_errors >= 3) {
+        el.className = "comm-alert error";
+        el.textContent = `⚠️ STM32 通讯异常：连续错误 ${comm.consecutive_errors} 次，请检查串口连接`;
+        el.style.display = "";
+      } else if (comm.consecutive_errors > 0) {
+        el.className = "comm-alert warn";
+        el.textContent = `⚠️ STM32 通讯不稳定：连续错误 ${comm.consecutive_errors} 次`;
+        el.style.display = "";
+      } else {
+        el.style.display = "none";
+      }
     }
 
     const elStm32Port = document.getElementById("stm32-port");
@@ -711,6 +778,7 @@
         await loadPorts();
         const st = await apiGet("/api/state");
         setConnBadge("后端已连接", "online");
+        updateCommAlert(st.comm);
         elTarget.value = st.target.toFixed(1);
         elTargetDisplay.textContent = st.target.toFixed(1);
         elPeriod.value = st.period.toFixed(3);
@@ -1076,6 +1144,9 @@
               elEnrichStatus.className = "badge badge-idle";
             }
           }
+          if (msg.comm) {
+            updateCommAlert(msg.comm);
+          }
         } catch (e) {
           console.error("解析 WS 消息失败", e);
         }
@@ -1320,6 +1391,42 @@
 
     // 定时刷新 TIC / EIC
     setInterval(refreshMsSpectrum, 5000);
+
+    // ---- 最近日志面板 ----
+    const elLogLevel = document.getElementById("log-level");
+    const elLogView = document.getElementById("log-view");
+    const elLogInfo = document.getElementById("log-info");
+
+    function escapeHtml(s) {
+      return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    async function refreshLogs() {
+      try {
+        const level = elLogLevel.value;
+        const r = await apiGet(`/api/logs/recent?lines=80&level=${level}`);
+        if (r.ok) {
+          const html = r.lines
+            .map((ln) => {
+              let cls = "";
+              if (ln.includes(" | ERROR") || ln.includes(" | CRITICAL")) cls = "error";
+              else if (ln.includes(" | WARNING")) cls = "warn";
+              return `<span class="${cls}">${escapeHtml(ln)}</span>`;
+            })
+            .join("\n");
+          elLogView.innerHTML = html;
+          elLogView.scrollTop = elLogView.scrollHeight;
+          elLogInfo.textContent = `共 ${r.lines.length} 条`;
+        }
+      } catch (e) {
+        console.warn("获取日志失败", e);
+      }
+    }
+
+    document.getElementById("btn-log-refresh").onclick = refreshLogs;
+    elLogLevel.onchange = refreshLogs;
+    setInterval(refreshLogs, 5000);
+    refreshLogs();
 
     initFromBackend();
     connectWs();

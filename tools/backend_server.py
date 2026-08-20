@@ -601,6 +601,10 @@ class ControlContext:
                 "duration": self.enrichment_duration,
                 "remaining": self.enrichment_remaining(),
             },
+            "comm": {
+                "open": bool(self._modbus_cli and self._modbus_cli._ser and self._modbus_cli._ser.is_open),
+                "consecutive_errors": self._modbus_cli.consecutive_errors if self._modbus_cli else -1,
+            },
             "pid": {
                 "kp": self.pid_kp,
                 "ki": self.pid_ki,
@@ -770,6 +774,10 @@ async def get_state():
             "target": ctx.enrichment_target,
             "duration": ctx.enrichment_duration,
             "remaining": ctx.enrichment_remaining(),
+        },
+        "comm": {
+            "open": bool(ctx._modbus_cli and ctx._modbus_cli._ser and ctx._modbus_cli._ser.is_open),
+            "consecutive_errors": ctx._modbus_cli.consecutive_errors if ctx._modbus_cli else -1,
         },
         "ms": {
             "server": ctx.ms_server,
@@ -1361,6 +1369,37 @@ async def api_health():
     overall = health["stm32"]["open"]
     logger.debug("健康检查: stm32=%s", health["stm32"]["healthy"])
     return {"ok": overall, "health": health}
+
+
+@app.get("/api/logs/recent")
+async def api_logs_recent(lines: int = 80, level: str = "all"):
+    """返回最近日志（读取 logs/backend.log 末尾若干行，可按级别过滤）。"""
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+    log_path = os.path.join(log_dir, "backend.log")
+    if not os.path.exists(log_path):
+        return {"ok": True, "lines": [], "path": str(log_path)}
+
+    lines = max(1, min(int(lines), 500))
+    level_filters = {
+        "all": None,
+        "warning": ("WARNING", "ERROR", "CRITICAL"),
+        "error": ("ERROR", "CRITICAL"),
+        "info": ("INFO", "WARNING", "ERROR", "CRITICAL"),
+    }
+    allowed = level_filters.get(level, None)
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            tail = fh.readlines()
+        # 只保留最近的日志（取足够大的尾部再过滤，避免全文件扫描）
+        tail = tail[-max(500, lines * 4):]
+        if allowed is not None:
+            tail = [ln for ln in tail if any(f" | {lv}" in ln for lv in allowed)]
+        result = [ln.rstrip("\n") for ln in tail[-lines:]]
+        return {"ok": True, "lines": result, "path": str(log_path)}
+    except Exception as e:  # noqa: BLE001
+        logger.error("读取日志失败: %s", e)
+        return {"ok": False, "error": str(e)}
 
 
 @app.websocket("/ws/pressure")

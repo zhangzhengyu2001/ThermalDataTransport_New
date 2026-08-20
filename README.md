@@ -300,6 +300,8 @@ uvicorn tools.backend_server:app --host 0.0.0.0 --port 8000
 - **数据保存**：气压历史数据一键保存为 CSV
 - **实时质谱图**：TIC（m/z 50-500）与 EIC 分属独立图窗；EIC 支持添加/移除任意 m/z 范围曲线，每 5 秒增量刷新
 - **质谱数据保存**：TIC/EIC 曲线数据自动追加保存到 `data/ms_curves_*.csv`（长表格式：time_min, series, intensity）；可选开启"保存原始谱图快照"，按设定间隔（1/5/10/30 分钟）把最新谱图的完整 m/z-强度保存到 `data/ms_spectra_*.csv`
+- **通讯告警**：STM32 通讯连续出错时页面顶部立即显示黄色/红色告警条
+- **最近日志**：页面底部内置日志面板，实时显示最近 80 条日志，可按级别（全部/警告/错误）过滤
 
 ### EIC 页面 (`mz_chro.html`)
 
