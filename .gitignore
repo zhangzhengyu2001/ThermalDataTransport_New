@@ -23,6 +23,10 @@ env/
 Thumbs.db
 *.log
 
+# Runtime data & logs
+data/
+logs/
+
 # Environment
 .env
 

@@ -1,6 +1,6 @@
 # 质谱数据实时传输与参数控制框架
 
-本系统用于质谱实验中对**气压、电压的闭环控制**，并与质谱仪器的数据采集同步，实现实时、远程操作和监控。
+本系统用于质谱实验中对**气压的闭环控制**，并与质谱仪器的数据采集同步，实现实时、远程操作和监控。
 
 ---
 
@@ -22,8 +22,6 @@ flowchart TB
 
         subgraph HW_IO["硬件 I/O (USB-to-TTL)"]
             STM32_COM["COMx → STM32<br/>Modbus RTU 115200"]
-            POWER_COM["COMy → 高压数控电源<br/>Modbus RTU 9600"]
-            CURRENT_COM["COMz → 电流计<br/>ASCII 9600"]
         end
     end
 
@@ -34,8 +32,6 @@ flowchart TB
     BACKEND <-->|WebSocket| WEB
     BACKEND <-->|HTTP| MZ_PAGE
     BACKEND <-->|Serial/Modbus| STM32_COM
-    BACKEND <-->|Serial/Modbus| POWER_COM
-    BACKEND <-->|Serial/ASCII| CURRENT_COM
 
     STM32_COM --> STM32_MCU["STM32F103<br/>气压PID控制<br/>MFC阀门驱动"]
     STM32_MCU --> BMP280+6847A["BMP280+6847A<br/>气压传感器"]
@@ -47,10 +43,12 @@ flowchart TB
 | 功能 | 说明 |
 |------|------|
 | **气压 PID 闭环控制** | STM32 单片机通过 BMP280+6847A 传感器读取气压，PID 算法计算后驱动 MFC 阀门调节流量；上位机可远程设定目标值、PID 参数及控制模式 |
-| **高压数控电源控制** | 通过 Modbus RTU 协议控制高压电源输出电压（量程默认 10 kV） |
 | **质谱数据远程读写** | 通过 FastAPI RPC 代理，远程调用 Thermo MSFileReader COM 库读取 `.raw` 文件中的质谱图、提取离子流图（EIC）、谱图计数等信息 |
-| **实时数据监控** | WebSocket 推送实时气压、MFC 开度、电流等数据到前端图表展示 |
-| **质谱-气压关联日志** | 一键记录当前气压、电压与对应质谱采集时间，生成 CSV 日志 |
+| **实时数据监控** | WebSocket 推送实时气压、MFC 开度等数据到前端图表展示 |
+| **质谱-气压关联日志** | 一键记录当前气压与对应质谱采集时间，生成 CSV 日志 |
+| **富集检测模式** | 一键设定富集目标气压与时长，计时结束后自动将目标气压设置为 100000 Pa |
+| **实时质谱图** | 独立图窗实时显示 TIC（m/z 50-500）与可自定义的 EIC 曲线，定时增量刷新质谱数据 |
+| **质谱数据保存** | 曲线数据（TIC/EIC）自动保存为 CSV；可选按间隔保存原始谱图快照（m/z-强度） |
 | **远程文件浏览器** | 前端通过 HTTP 代理浏览大质谱主机上的 `.raw` 文件目录（文件访问白名单机制） |
 | **EIC 可视化** | 独立页面可绘制指定 m/z 范围的提取离子流图（EIC） |
 
@@ -72,7 +70,7 @@ backend/
 │   ├── pc_pressure_controller.py  #   PC 端气压闭环控制示例（独立脚本，旧版）
 │   ├── MFC.py                     #   MFC 通讯协议函数集
 │   ├── logger_config.py           #   统一日志配置（控制台+文件，按天轮转）
-│   ├── config.json                #   控制参数配置（串口、PID、电源量程等）
+│   ├── config.json                #   控制参数配置（串口、PID 等）
 │   ├── start_backend.txt          #   启动命令备忘
 │   ├── __init__.py                #   包初始化
 │   ├── data_visualization.ipynb   #   数据可视化 Jupyter Notebook
@@ -81,14 +79,12 @@ backend/
 │       └── mz_chro.html           #     质谱EIC可视化页面
 │
 ├── modbus/                         # Modbus 协议模块
-│   ├── digital_power.py           #   数字高压电源 Modbus RTU 控制类
 │   ├── MFC.py                     #   MFC 相关（备用）
 │   └── modbus.ipynb               #   Modbus 调试 Notebook
 │
 ├── data/                           # 数据输出目录
 │   └── pressure_*.csv             #   气压历史数据
 │   └── ms_log.csv                 #   质谱关联日志
-│   └── current_*.csv              #   电流历史数据
 │
 ├── logs/                           # 日志文件目录（按天轮转，保留 30 天）
 │
@@ -109,7 +105,7 @@ backend/
 |------|------|
 | **大质谱主机** | Windows，安装 Thermo Xcalibur / MSFileReader |
 | **控制主机** | Windows / Linux，Python 3.10+ |
-| **硬件** | USB-to-TTL 模块连接 STM32 MCU 和高压电源 |
+| **硬件** | USB-to-TTL 模块连接 STM32 MCU |
 
 ### 1. Python 依赖安装
 
@@ -169,11 +165,6 @@ uvicorn tools.backend_server:app --reload --host 0.0.0.0 --port 8000
     },
     "period": 0.1,
     "history_window": 60.0
-  },
-  "power": {
-    "addr": 1,
-    "baudrate": 9600,
-    "max_voltage": 10000
   }
 }
 ```
@@ -190,11 +181,9 @@ uvicorn tools.backend_server:app --reload --host 0.0.0.0 --port 8000
 | `GET` | `/api/state` | 获取全局状态 |
 | `POST` | `/api/open-stm32` | 打开 STM32 Modbus 串口 |
 | `POST` | `/api/close-stm32` | 关闭 STM32 串口 |
-| `POST` | `/api/open-power` | 打开数字电源串口 |
-| `POST` | `/api/close-power` | 关闭电源串口 |
-| `POST` | `/api/open-current` | 打开电流监控串口 |
-| `POST` | `/api/close-current` | 关闭电流串口 |
 | `POST` | `/api/target` | 设置目标气压 (Pa) |
+| `POST` | `/api/enrichment/start` | 一键开启富集检测（目标气压 + 时长） |
+| `POST` | `/api/enrichment/stop` | 手动取消富集检测 |
 | `POST` | `/api/pid` | 设置 PID 参数并写入 STM32 |
 | `POST` | `/api/reload-pid` | 从配置文件重载 PID 并写入 STM32 |
 | `POST` | `/api/period` | 设置采样/控制周期 (s) |
@@ -203,9 +192,7 @@ uvicorn tools.backend_server:app --reload --host 0.0.0.0 --port 8000
 | `POST` | `/api/stop` | 停止气压控制 (start_pid=0) |
 | `POST` | `/api/monitor-on` | 仅监测模式 |
 | `POST` | `/api/monitor-off` | 切换为控制模式 |
-| `POST` | `/api/power/voltage` | 设置电源输出电压 (V) |
 | `POST` | `/api/save-data` | 保存气压历史数据到 CSV |
-| `POST` | `/api/save-current-data` | 保存电流历史数据到 CSV |
 | `POST` | `/api/ms-open` | 打开远程 .raw 文件 |
 | `POST` | `/api/ms-close` | 关闭远程 .raw 文件 |
 | `POST` | `/api/ms-log` | 刷新质谱并写入关联日志 |
@@ -214,6 +201,8 @@ uvicorn tools.backend_server:app --reload --host 0.0.0.0 --port 8000
 | `POST` | `/api/ms-fs-list` | 列出远程目录内容 |
 | `POST` | `/api/ms-chro` | 获取质谱 EIC 数据 |
 | `POST` | `/api/ms-chro-lite` | 轻量版 EIC 数据获取 |
+| `POST` | `/api/ms/curves-append` | 追加保存增量 TIC/EIC 曲线数据到 CSV |
+| `POST` | `/api/ms/spectrum-snapshot` | 保存最新一张谱图的 m/z-强度数据到 CSV |
 | `WS` | `/ws/pressure` | WebSocket 实时数据推送 |
 
 ### MS 数据服务 (`ServerCode/MSHTTPFastAPI.py` @ :8899)
@@ -243,9 +232,8 @@ POST /Open
 ## 数据流说明
 
 1. **气压控制流**：前端设置目标值 → `backend_server` 通过 Modbus 写入 STM32 → STM32 内部 PID 算法计算 → 驱动 MFC 阀门 → BMP280（环境气压）+ 6847A（腔体压差）双传感器读取反馈气压 → 前端 WebSocket 实时展示
-2. **电压控制流**：前端设定目标电压 → `backend_server` 通过 Modbus 写入高压电源 → 电压-寄存器换算 → 确认写入
-3. **质谱数据流**：前端选择 `.raw` 文件 → `backend_server` 代理 HTTP 请求到 MS 主机 → MS 主机调用 COM 库读取数据 → 返回时间/强度数组 → 前端绘图
-4. **日志记录流**：点击"刷新质谱并写入日志" → 获取当前质谱时间 → 将时间、气压、电压等信息写入 `data/ms_log.csv`
+2. **质谱数据流**：前端选择 `.raw` 文件 → `backend_server` 代理 HTTP 请求到 MS 主机 → MS 主机调用 COM 库读取数据 → 返回时间/强度数组 → 前端绘图
+3. **日志记录流**：点击"刷新质谱并写入日志" → 获取当前质谱时间 → 将时间、气压等信息写入 `data/ms_log.csv`
 
 ---
 
@@ -302,15 +290,16 @@ uvicorn tools.backend_server:app --host 0.0.0.0 --port 8000
 
 ### 主页 (`index.html`)
 
-- **串口管理**：刷新/打开/关闭 STM32、电源、电流三个串口
+- **串口管理**：刷新/打开/关闭 STM32 串口
 - **气压 PID 控制**：设定目标气压、PID 参数、采样周期
 - **模式切换**：仅监测模式 / PID 控制模式
-- **电源控制**：设定数字高压电源输出电压
+- **富集检测模式**：一键设定富集目标气压与时长，实时显示倒计时，结束后自动将目标气压设为 100000 Pa
 - **质谱操作**：浏览大质谱主机上的 `.raw` 文件（带文件浏览器弹窗）、打开/关闭/刷新
 - **实时图表**：
   - 滤波气压曲线 + 目标气压虚线 + MFC 开度曲线（Chart.js 双 Y 轴）
-  - 电流监控曲线
-- **数据保存**：气压历史数据和电流历史数据一键保存为 CSV
+- **数据保存**：气压历史数据一键保存为 CSV
+- **实时质谱图**：TIC（m/z 50-500）与 EIC 分属独立图窗；EIC 支持添加/移除任意 m/z 范围曲线，每 5 秒增量刷新
+- **质谱数据保存**：TIC/EIC 曲线数据自动追加保存到 `data/ms_curves_*.csv`（长表格式：time_min, series, intensity）；可选开启"保存原始谱图快照"，按设定间隔（1/5/10/30 分钟）把最新谱图的完整 m/z-强度保存到 `data/ms_spectra_*.csv`
 
 ### EIC 页面 (`mz_chro.html`)
 
@@ -325,6 +314,5 @@ uvicorn tools.backend_server:app --host 0.0.0.0 --port 8000
 1. **大质谱主机必须安装 Thermo MSFileReader**，否则 `MSHTTPFastAPI.py` 无法通过 COM 接口打开 `.raw` 文件
 2. **STM32 固件**：PID 控制算法在 MCU 上运行（周期 100 ms），上位机仅负责参数下发和状态读取
 3. **串口连接**：确认 USB-to-TTL 模块正确连接 STM32 的 UART1 引脚
-4. **高压电源安全**：设置电压前请确认量程配置（`tools/config.json` 中的 `max_voltage`）与实际设备一致
-5. **防火墙**：大质谱主机需开放 8899 端口，控制主机需开放 8000 端口
-6. **前端跨域**：后端已配置 CORS 允许所有来源，生产环境建议限制
+4. **防火墙**：大质谱主机需开放 8899 端口，控制主机需开放 8000 端口
+5. **前端跨域**：后端已配置 CORS 允许所有来源，生产环境建议限制

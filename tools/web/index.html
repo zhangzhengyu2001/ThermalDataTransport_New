@@ -2,134 +2,464 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>气压 PID 控制监控</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/luxon@3/build/global/luxon.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1/dist/chartjs-adapter-luxon.umd.min.js"></script>
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    h1 { margin-bottom: 10px; }
-    fieldset { margin-bottom: 12px; }
-    label { display: inline-block; width: 140px; }
-    input { margin: 2px 8px 2px 0; }
-    button { margin: 2px 8px 2px 0; }
-    #status { margin-top: 6px; color: #555; }
-    .ms-picker { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.35); z-index: 1000; }
+    :root {
+      --bg: #eef2f7;
+      --card: #ffffff;
+      --border: #e3e8f0;
+      --text: #1e293b;
+      --muted: #64748b;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --success: #059669;
+      --success-hover: #047857;
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --radius: 12px;
+      --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 6px 18px rgba(15, 23, 42, 0.05);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    }
+    .page { max-width: 1280px; margin: 0 auto; }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+    .header h1 { margin: 0; font-size: 22px; letter-spacing: 0.3px; }
+    .subtitle { margin-top: 4px; color: var(--muted); font-size: 13px; }
+
+    .conn-badge {
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      background: #e2e8f0;
+      color: #475569;
+    }
+    .conn-badge.online { background: #d1fae5; color: #047857; }
+    .conn-badge.offline { background: #fee2e2; color: #b91c1c; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 16px 18px;
+    }
+    .card-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #f1f5f9;
+    }
+    .card-title .icon { font-size: 18px; }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .row label { min-width: 96px; color: var(--muted); font-size: 13px; }
+
+    input[type="number"], input[type="text"], select {
+      padding: 7px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 13px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
+    input[type="number"] { width: 120px; }
+    .row select { flex: 1; min-width: 90px; }
+    .field { flex: 0 0 120px; width: 120px; }
+    .field-sm { flex: 0 0 100px; width: 100px; }
+    .grow { flex: 1; min-width: 120px; }
+    .short { flex: 0 0 80px !important; width: 80px !important; }
+
+    .btn {
+      padding: 7px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, transform 0.05s;
+    }
+    .btn:hover { background: #f8fafc; border-color: #cbd5e1; }
+    .btn:active { transform: scale(0.97); }
+    .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+    .btn-success { background: var(--success); border-color: var(--success); color: #fff; }
+    .btn-success:hover { background: var(--success-hover); }
+    .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+    .btn-danger:hover { background: var(--danger-hover); }
+    .row .btn { margin-left: auto; }
+    .row.start .btn { margin-left: 0; }
+    .btn-group { display: inline-flex; align-items: center; gap: 4px; }
+
+    .pill {
+      display: inline-block;
+      padding: 3px 12px;
+      border-radius: 999px;
+      background: #eff6ff;
+      color: var(--primary);
+      font-weight: 600;
+      font-size: 13px;
+      flex: 0 0 auto;
+    }
+    .hint { font-size: 12px; color: var(--muted); }
+    .row-hint {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .badge-idle { background: #f1f5f9; color: #64748b; }
+    .badge-active { background: #d1fae5; color: #047857; animation: pulse 1.6s infinite; }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0.35); }
+      50% { box-shadow: 0 0 0 6px rgba(5, 150, 105, 0); }
+    }
+
+    .status-line {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: #f8fafc;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      font-size: 13px;
+      color: var(--muted);
+      min-height: 20px;
+    }
+
+    .chart-wrap { position: relative; height: 300px; }
+    .chart-list { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+    .status-global { margin-bottom: 14px; }
+    .tic-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #eff6ff;
+      color: var(--primary);
+      font-size: 12px;
+      font-weight: 600;
+      flex: 0 0 auto;
+    }
+    .eic-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 10px;
+      min-height: 26px;
+    }
+    .eic-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #f1f5f9;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: #334155;
+    }
+    .eic-chip .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+    .eic-chip button {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #94a3b8;
+      font-size: 13px;
+      line-height: 1;
+      padding: 0;
+      margin: 0;
+    }
+    .eic-chip button:hover { color: var(--danger); }
+    .chart-hint {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 14px;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      background: #f8fafc;
+      pointer-events: none;
+    }
+
+    /* 远程文件选择弹窗 */
+    .ms-picker {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.45);
+      z-index: 1000;
+      padding: 16px;
+    }
     .ms-picker.show { display: flex; }
-    .ms-picker-panel { width: 760px; max-width: 95vw; background: #fff; border: 1px solid #ccc; border-radius: 6px; padding: 12px; box-shadow: 0 6px 18px rgba(0,0,0,0.2); }
+    .ms-picker-panel {
+      width: 760px;
+      max-width: 95vw;
+      background: #fff;
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+    }
+    .ms-picker-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+    .ms-picker-toolbar strong { min-width: 90px; }
+    .ms-picker-toolbar label { color: var(--muted); font-size: 13px; }
+    .ms-picker-path { margin-bottom: 10px; }
+    .ms-path {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      color: #334155;
+      word-break: break-all;
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #f8fafc;
+      margin-top: 4px;
+    }
     .ms-picker-row { display: flex; gap: 12px; }
-    .ms-picker-col { flex: 1; border: 1px solid #ddd; border-radius: 4px; min-height: 220px; max-height: 320px; overflow: auto; }
-    .ms-picker-col h4 { margin: 6px 8px; font-size: 14px; }
+    .ms-picker-col {
+      flex: 1;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      min-height: 220px;
+      max-height: 320px;
+      overflow: auto;
+      background: #fff;
+    }
+    .ms-picker-col h4 { margin: 8px 10px; font-size: 13px; color: var(--muted); }
     .ms-picker-list { list-style: none; padding: 0 8px 8px; margin: 0; }
-    .ms-picker-list li { padding: 4px 6px; cursor: pointer; border-radius: 3px; }
-    .ms-picker-list li:hover { background: #f1f1f1; }
-    .ms-picker-list li.selected { background: #dbe9ff; }
-    .ms-path { font-family: monospace; font-size: 12px; color: #333; word-break: break-all; padding: 4px 6px; border: 1px solid #ddd; border-radius: 4px; background: #fafafa; }
+    .ms-picker-list li {
+      padding: 6px 8px;
+      cursor: pointer;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-bottom: 2px;
+    }
+    .ms-picker-list li:hover { background: #f1f5f9; }
+    .ms-picker-list li.selected { background: #dbeafe; color: #1d4ed8; font-weight: 600; }
+    .ms-picker-footer { margin-top: 12px; display: flex; align-items: center; gap: 8px; }
+
+    @media (max-width: 720px) {
+      body { padding: 12px; }
+      .chart-wrap { height: 240px; }
+    }
   </style>
 </head>
 <body>
-  <h1>气压 PID 控制监控</h1>
+  <div class="page">
+    <header class="header">
+      <div>
+        <h1>🧪 气压 PID 控制监控</h1>
+        <div class="subtitle">质谱实验 · 气压闭环控制 / 富集检测 / 质谱日志</div>
+      </div>
+      <span class="conn-badge" id="conn-badge">连接中…</span>
+    </header>
 
-  <fieldset>
-    <legend>串口配置</legend>
-    <div>
-      <strong>STM32 (Modbus)</strong><br />
-      <label>串口号:</label>
-      <select id="stm32-port"></select>
-      <label>波特率:</label><input id="stm32-baud" type="number" value="115200" />
-      <label>地址:</label><input id="stm32-addr" type="number" value="1" />
-      <button id="btn-open-stm32">打开 STM32 串口</button>
-      <button id="btn-close-stm32">关闭</button>
-    </div>
-    <div>
-      <strong>数字电源</strong><br />
-      <label>串口号:</label>
-      <select id="power-port"></select>
-      <button id="btn-open-power">打开电源串口</button>
-      <button id="btn-close-power">关闭</button>
-    </div>
-    <div>
-      <strong>电流监控</strong><br />
-      <label>串口号:</label>
-      <select id="current-port"></select>
-      <span>波特率: 9600 (固定)</span>
-      <button id="btn-open-current">打开电流串口</button>
-      <button id="btn-close-current">关闭</button>
-    </div>
-    <div>
-      <button id="btn-refresh-ports">刷新串口列表</button>
-    </div>
-  </fieldset>
+    <div class="grid">
 
-  <fieldset>
-    <legend>控制参数</legend>
-    <div>
-      <label>目标气压 (Pa):</label>
-      <input id="target" type="number" step="1" value="50000" />
-      <button id="btn-set-target">设置</button>
-      <span>当前目标: <span id="target-display">--</span> Pa</span>
-    </div>
-    <div>
-      <label>采样/控制周期 (s):</label>
-      <input id="period" type="number" step="0.01" value="0.1" />
-      <button id="btn-set-period">设置周期</button>
-    </div>
-    <div>
-      <label>历史窗口 (s):</label>
-      <input id="history-window" type="number" step="1" value="60" />
-      <button id="btn-set-history-window">设置窗口</button>
-    </div>
-    <div>
-      <button id="btn-start">开始控制</button>
-      <button id="btn-stop">停止控制</button>
-      <button id="btn-monitor-on">仅监测模式(start_pid=0)</button>
-      <button id="btn-monitor-off">控制模式(start_pid>0)</button>
-      <button id="btn-save-data">保存数据</button>
-      <button id="btn-reload-pid">重新加载PID并写入STM32</button>
-    </div>
-    <div id="status"></div>
-  </fieldset>
+      <section class="card">
+        <div class="card-title"><span class="icon">🔌</span>串口配置</div>
+        <div class="row">
+          <label>STM32 串口</label>
+          <select id="stm32-port" class="grow"></select>
+          <button class="btn btn-primary" id="btn-open-stm32">打开串口</button>
+          <button class="btn" id="btn-close-stm32">关闭</button>
+        </div>
+        <div class="row">
+          <label>波特率</label>
+          <input id="stm32-baud" type="number" value="115200" class="field" />
+          <label>设备地址</label>
+          <input id="stm32-addr" type="number" value="1" class="short" />
+          <button class="btn" id="btn-refresh-ports">刷新串口列表</button>
+        </div>
+      </section>
 
-  <fieldset>
-    <legend>电源控制</legend>
-    <div>
-      <label>目标电压 (V):</label>
-      <input id="power-voltage" type="number" step="0.1" value="0" />
-      <button id="btn-set-power-voltage">设置电压</button>
-      <span>当前设定: <span id="power-voltage-display">--</span> V</span>
-    </div>
-  </fieldset>
+      <section class="card">
+        <div class="card-title"><span class="icon">⏱️</span>富集检测模式</div>
+        <div class="row">
+          <label>目标气压 (Pa)</label>
+          <input id="enrich-target" type="number" step="1" value="1000" class="field" />
+        </div>
+        <div class="row">
+          <label>时长 (分钟)</label>
+          <input id="enrich-minutes" type="number" step="1" value="30" class="field" />
+        </div>
+        <div class="row start">
+          <button class="btn btn-primary" id="btn-enrich-start">开启富集</button>
+          <button class="btn" id="btn-enrich-stop">取消</button>
+        </div>
+        <div class="row-hint">
+          <span class="hint">计时结束后自动将目标气压设置为 100000 Pa</span>
+          <span class="badge badge-idle" id="enrich-status">未开启</span>
+        </div>
+      </section>
 
-  <fieldset>
-    <legend>质谱日志</legend>
-    <div>
-      <label>MS 服务器 IP:</label>
-      <input id="ms-server" type="text" value="192.168.31.99" />
+      <section class="card">
+        <div class="card-title"><span class="icon">🎯</span>控制参数</div>
+        <div class="row">
+          <label>目标气压 (Pa)</label>
+          <input id="target" type="number" step="1" value="50000" class="field" />
+          <span class="btn-group">
+            <button class="btn btn-primary" id="btn-set-target">设置</button>
+            <span class="pill" id="target-display">--</span>
+          </span>
+          <span class="hint">Pa</span>
+        </div>
+        <div class="row">
+          <label>采样周期 (s)</label>
+          <input id="period" type="number" step="0.01" value="0.1" class="field" />
+          <button class="btn" id="btn-set-period">设置</button>
+          <label>历史窗口 (s)</label>
+          <input id="history-window" type="number" step="1" value="60" class="field" />
+          <button class="btn" id="btn-set-history-window">设置</button>
+        </div>
+        <div class="row">
+          <button class="btn btn-success" id="btn-start">开始控制</button>
+          <button class="btn btn-danger" id="btn-stop">停止控制</button>
+          <button class="btn" id="btn-monitor-on">仅监测</button>
+          <button class="btn" id="btn-monitor-off">控制模式</button>
+          <button class="btn" id="btn-save-data">保存数据</button>
+          <button class="btn" id="btn-reload-pid">重载 PID</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title"><span class="icon">🧬</span>质谱日志</div>
+        <div class="row">
+          <label>MS 服务器 IP</label>
+          <input id="ms-server" type="text" value="192.168.31.99" class="grow" />
+        </div>
+        <div class="row">
+          <label>.raw 文件路径</label>
+          <input id="ms-raw-path" type="text" class="grow" />
+          <button class="btn" id="btn-ms-browse">浏览</button>
+        </div>
+        <div class="row">
+          <button class="btn" id="btn-ms-open">打开文件</button>
+          <button class="btn" id="btn-ms-close">关闭文件</button>
+          <button class="btn btn-primary" id="btn-ms-log">刷新质谱并写入日志</button>
+          <button class="btn" id="btn-open-mz-page">打开 EIC 页面</button>
+        </div>
+      </section>
+
     </div>
-    <div>
-      <label>.raw 文件路径:</label>
-      <input id="ms-raw-path" type="text" style="width: 420px" />
-      <button id="btn-ms-browse">浏览选择</button>
+
+    <div class="status-line status-global" id="status"></div>
+
+    <div class="chart-list">
+
+      <section class="card">
+        <div class="card-title"><span class="icon">📈</span>实时监控</div>
+        <div class="chart-wrap">
+          <canvas id="pressure-chart"></canvas>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title"><span class="icon">📊</span>TIC 监控 (m/z 50-500)</div>
+        <div class="chart-wrap">
+          <canvas id="tic-chart"></canvas>
+          <div class="chart-hint" id="tic-hint">请先在"质谱日志"中打开 .raw 文件</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title"><span class="icon">🧩</span>EIC 监控</div>
+        <div class="row">
+          <label>质荷比范围:</label>
+          <input id="eic-range" type="text" placeholder="例如 100-200" class="grow" />
+          <button class="btn btn-primary" id="btn-add-eic">添加 EIC</button>
+        </div>
+        <div id="eic-chips" class="eic-chips"></div>
+        <div class="chart-wrap">
+          <canvas id="eic-chart"></canvas>
+          <div class="chart-hint" id="eic-hint">请先在"质谱日志"中打开 .raw 文件</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title"><span class="icon">💾</span>质谱数据保存</div>
+        <div class="row">
+          <span class="hint" style="line-height: 1.6;">曲线数据（TIC / EIC）将自动保存到<br /><code>data/ms_curves_*.csv</code></span>
+        </div>
+        <div class="row">
+          <label style="min-width: 150px;">
+            <input type="checkbox" id="save-spectra" /> 保存原始谱图快照
+          </label>
+          <label>间隔</label>
+          <select id="spectra-interval">
+            <option value="1">1 分钟</option>
+            <option value="5" selected>5 分钟</option>
+            <option value="10">10 分钟</option>
+            <option value="30">30 分钟</option>
+          </select>
+        </div>
+        <div class="hint">勾选后按设定间隔保存最新一张谱图的完整 m/z-强度数据到 <code>data/ms_spectra_*.csv</code></div>
+      </section>
+
     </div>
-    <div>
-      <button id="btn-ms-open">打开远程文件</button>
-      <button id="btn-ms-close">关闭远程文件</button>
-      <button id="btn-ms-log">刷新质谱并写入日志</button>
-      <button id="btn-open-mz-page">打开质谱EIC页面</button>
-    </div>
-  </fieldset>
+  </div>
 
   <div id="ms-picker" class="ms-picker">
     <div class="ms-picker-panel">
-      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
-        <strong style="min-width: 90px;">选择 .raw</strong>
+      <div class="ms-picker-toolbar">
+        <strong>选择 .raw</strong>
         <label>根目录:</label>
-        <select id="ms-root"></select>
-        <button id="btn-ms-up">上一级</button>
-        <button id="btn-ms-refresh">刷新</button>
+        <select id="ms-root" class="grow"></select>
+        <button class="btn" id="btn-ms-up">上一级</button>
+        <button class="btn" id="btn-ms-refresh">刷新</button>
       </div>
-      <div style="margin-bottom: 8px;">
-        <div>当前路径:</div>
+      <div class="ms-picker-path">
+        <div class="hint">当前路径:</div>
         <div id="ms-path" class="ms-path">--</div>
       </div>
       <div class="ms-picker-row">
@@ -142,25 +472,14 @@
           <ul id="ms-files" class="ms-picker-list"></ul>
         </div>
       </div>
-      <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
+      <div class="ms-picker-footer">
         <span>已选:</span>
-        <span id="ms-selected" class="ms-path" style="flex: 1;">--</span>
-        <button id="btn-ms-select">确定</button>
-        <button id="btn-ms-cancel">取消</button>
+        <span id="ms-selected" class="ms-path grow">--</span>
+        <button class="btn btn-primary" id="btn-ms-select">确定</button>
+        <button class="btn" id="btn-ms-cancel">取消</button>
       </div>
     </div>
   </div>
-
-  <canvas id="pressure-chart" height="120"></canvas>
-
-  <fieldset>
-    <legend>电流监控</legend>
-    <div>
-      <button id="btn-save-current">保存电流数据</button>
-      <span style="margin-left: 16px; color: #666;">单位: uA</span>
-    </div>
-    <canvas id="current-chart" height="120"></canvas>
-  </fieldset>
 
   <script>
     const backendBase = "http://localhost:8000";
@@ -171,14 +490,20 @@
     const elPeriod = document.getElementById("period");
     const elHistoryWindow = document.getElementById("history-window");
     const elStatus = document.getElementById("status");
+    const elConnBadge = document.getElementById("conn-badge");
+
+    function setConnBadge(text, state) {
+      elConnBadge.textContent = text;
+      elConnBadge.className = "conn-badge " + state;
+    }
 
     const elStm32Port = document.getElementById("stm32-port");
     const elStm32Baud = document.getElementById("stm32-baud");
     const elStm32Addr = document.getElementById("stm32-addr");
 
-    const elPowerPort = document.getElementById("power-port");
-    const elPowerVoltage = document.getElementById("power-voltage");
-    const elPowerVoltageDisplay = document.getElementById("power-voltage-display");
+    const elEnrichTarget = document.getElementById("enrich-target");
+    const elEnrichMinutes = document.getElementById("enrich-minutes");
+    const elEnrichStatus = document.getElementById("enrich-status");
 
     const elMsServer = document.getElementById("ms-server");
     const elMsRawPath = document.getElementById("ms-raw-path");
@@ -193,8 +518,6 @@
     const elMsRefresh = document.getElementById("btn-ms-refresh");
     const elMsSelect = document.getElementById("btn-ms-select");
     const elMsCancel = document.getElementById("btn-ms-cancel");
-
-    const elCurrentPort = document.getElementById("current-port");
 
     const maxPoints = 300;
 
@@ -241,6 +564,8 @@
       data: chartData,
       options: {
         animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
         scales: {
           x: {
             type: "time",
@@ -265,44 +590,6 @@
             },
             grid: {
               drawOnChartArea: false,
-            },
-          },
-        },
-      },
-    });
-
-    const ctxCurrentChart = document.getElementById("current-chart").getContext("2d");
-    const currentChartData = {
-      labels: [],
-      datasets: [
-        {
-          label: "电流 (uA)",
-          data: [],
-          borderColor: "rgb(255, 159, 64)",
-          borderWidth: 1,
-          fill: false,
-        },
-      ],
-    };
-
-    const currentChart = new Chart(ctxCurrentChart, {
-      type: "line",
-      data: currentChartData,
-      options: {
-        animation: false,
-        scales: {
-          x: {
-            type: "time",
-            time: {
-              unit: "second",
-              tooltipFormat: "HH:mm:ss",
-            },
-          },
-          y: {
-            beginAtZero: true,
-            title: {
-              display: true,
-              text: "电流 (uA)",
             },
           },
         },
@@ -414,8 +701,6 @@
           }
         };
         fillSelect(elStm32Port, ports);
-        fillSelect(elPowerPort, ports);
-        fillSelect(elCurrentPort, ports);
       } catch (e) {
         console.warn("获取串口列表失败", e);
       }
@@ -425,6 +710,7 @@
       try {
         await loadPorts();
         const st = await apiGet("/api/state");
+        setConnBadge("后端已连接", "online");
         elTarget.value = st.target.toFixed(1);
         elTargetDisplay.textContent = st.target.toFixed(1);
         elPeriod.value = st.period.toFixed(3);
@@ -432,15 +718,14 @@
         if (st.stm32.port) elStm32Port.value = st.stm32.port;
         elStm32Baud.value = st.stm32.baud;
         elStm32Addr.value = st.stm32.addr;
-        if (st.power) {
-          if (st.power.port) elPowerPort.value = st.power.port;
-          if (typeof st.power.current_voltage === "number") {
-            elPowerVoltage.value = st.power.current_voltage.toFixed(2);
-            elPowerVoltageDisplay.textContent = st.power.current_voltage.toFixed(2);
-          }
-        }
-        if (st.current && st.current.port) {
-          elCurrentPort.value = st.current.port;
+        if (st.enrichment && st.enrichment.active) {
+          elEnrichTarget.value = st.enrichment.target.toFixed(1);
+          elEnrichMinutes.value = (st.enrichment.duration / 60).toFixed(1);
+          const secs = Math.max(0, Math.ceil(st.enrichment.remaining));
+          const mm = Math.floor(secs / 60);
+          const ss = secs % 60;
+          elEnrichStatus.textContent = `富集中: ${st.enrichment.target} Pa，剩余 ${mm}分${ss}秒`;
+          elEnrichStatus.className = "badge badge-active";
         }
         if (st.monitor_only) {
           elStatus.textContent = "当前为仅监测模式 (start_pid=0)";
@@ -448,6 +733,7 @@
           elStatus.textContent = "当前为控制模式 (start_pid>0)";
         }
       } catch (e) {
+        setConnBadge("后端未连接", "offline");
         console.warn("获取初始状态失败", e);
       }
     }
@@ -531,53 +817,36 @@
       }
     };
 
-      document.getElementById("btn-open-current").onclick = async () => {
-        const port = elCurrentPort.value.trim();
-        if (!port) return alert("请选择电流串口号");
-        try {
-          elStatus.textContent = "打开电流串口...";
-          await apiPost("/api/open-current", { port });
-          elStatus.textContent = "电流串口已打开 (9600 波特率)";
-        } catch (e) {
-          console.error(e);
-          elStatus.textContent = "打开电流串口失败";
-        }
-      };
+    document.getElementById("btn-enrich-start").onclick = async () => {
+      const target = parseFloat(elEnrichTarget.value);
+      const minutes = parseFloat(elEnrichMinutes.value);
+      if (isNaN(target) || target <= 0) return alert("请输入合法的富集目标气压");
+      if (isNaN(minutes) || minutes <= 0) return alert("请输入合法的富集时长");
+      try {
+        elStatus.textContent = "开启富集检测模式...";
+        const r = await apiPost("/api/enrichment/start", { target, duration: minutes * 60 });
+        elEnrichTarget.value = r.enrichment.target.toFixed(1);
+        elEnrichMinutes.value = (r.enrichment.duration / 60).toFixed(1);
+        elEnrichStatus.className = "badge badge-active";
+        elStatus.textContent = "富集检测已开启，结束后自动设置目标气压为 100000 Pa";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "开启富集检测失败";
+      }
+    };
 
-      document.getElementById("btn-close-current").onclick = async () => {
-        try {
-          elStatus.textContent = "关闭电流串口...";
-          await apiPost("/api/close-current", {});
-          elStatus.textContent = "电流串口已关闭";
-        } catch (e) {
-          console.error(e);
-          elStatus.textContent = "关闭电流串口失败";
-        }
-      };
-
-      document.getElementById("btn-open-power").onclick = async () => {
-        const port = elPowerPort.value.trim();
-        if (!port) return alert("请选择电源串口号");
-        try {
-          elStatus.textContent = "打开电源串口...";
-          await apiPost("/api/open-power", { port, baudrate: 0, addr: 0 });
-          elStatus.textContent = "电源串口已打开";
-        } catch (e) {
-          console.error(e);
-          elStatus.textContent = "打开电源串口失败";
-        }
-      };
-
-      document.getElementById("btn-close-power").onclick = async () => {
-        try {
-          elStatus.textContent = "关闭电源串口...";
-          await apiPost("/api/close-power", {});
-          elStatus.textContent = "电源串口已关闭";
-        } catch (e) {
-          console.error(e);
-          elStatus.textContent = "关闭电源串口失败";
-        }
-      };
+    document.getElementById("btn-enrich-stop").onclick = async () => {
+      try {
+        elStatus.textContent = "取消富集检测...";
+        await apiPost("/api/enrichment/stop", {});
+        elEnrichStatus.textContent = "未开启";
+        elEnrichStatus.className = "badge badge-idle";
+        elStatus.textContent = "富集检测已取消";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "取消富集检测失败";
+      }
+    };
 
     document.getElementById("btn-refresh-ports").onclick = async () => {
       elStatus.textContent = "刷新串口列表...";
@@ -648,38 +917,6 @@
       }
     };
 
-    document.getElementById("btn-save-current").onclick = async () => {
-      try {
-        elStatus.textContent = "正在保存当前电流历史数据...";
-        const r = await apiPost("/api/save-current-data", {});
-        if (r.ok) {
-          elStatus.textContent = "电流历史数据已保存到 data/current_*.csv";
-        } else if (r.empty) {
-          elStatus.textContent = "当前电流历史缓冲区为空，未生成文件";
-        } else {
-          elStatus.textContent = "保存电流数据失败";
-        }
-      } catch (e) {
-        console.error(e);
-        elStatus.textContent = "保存电流数据失败";
-      }
-    };
-
-    document.getElementById("btn-set-power-voltage").onclick = async () => {
-      const v = parseFloat(elPowerVoltage.value);
-      if (isNaN(v)) return alert("请输入合法的目标电压");
-      try {
-        elStatus.textContent = "设置电源电压中...";
-        const r = await apiPost("/api/power/voltage", { voltage: v });
-        elPowerVoltage.value = r.voltage.toFixed(2);
-        elPowerVoltageDisplay.textContent = r.voltage.toFixed(2);
-        elStatus.textContent = "电源电压已设置，并已记录日志";
-      } catch (e) {
-        console.error(e);
-        elStatus.textContent = "设置电源电压失败";
-      }
-    };
-
     document.getElementById("btn-ms-open").onclick = async () => {
       const server = elMsServer.value.trim();
       const raw_path = elMsRawPath.value.trim();
@@ -690,6 +927,7 @@
         const r = await apiPost("/api/ms-open", { server, raw_path });
         console.log("MS Open 返回:", r.open_result);
         if (r.ok) {
+          resetMsSpectrumData();
           elStatus.textContent = "远程文件打开成功";
         } else {
           elStatus.textContent = "远程文件打开失败，请查看控制台返回";
@@ -771,6 +1009,7 @@
       try {
         elStatus.textContent = "关闭远程 MS 文件...";
         await apiPost("/api/ms-close", {});
+        resetMsSpectrumData();
         elStatus.textContent = "远程文件已关闭";
       } catch (e) {
         console.error(e);
@@ -800,7 +1039,10 @@
 
     function connectWs() {
       const ws = new WebSocket(wsUrl);
-      ws.onopen = () => console.log("WS 连接成功");
+      ws.onopen = () => {
+        console.log("WS 连接成功");
+        setConnBadge("实时推送已连接", "online");
+      };
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
@@ -821,16 +1063,18 @@
           }
           chart.update("none");
 
-          // 电流监控：后端以 current_a (单位 A) 下发
-          if (typeof msg.current_a === "number") {
-            const current_uA = msg.current_a * 1e6;
-            currentChartData.labels.push(t);
-            currentChartData.datasets[0].data.push(current_uA);
-            if (currentChartData.labels.length > maxPoints) {
-              currentChartData.labels.shift();
-              currentChartData.datasets[0].data.shift();
+          if (msg.enrichment) {
+            const e = msg.enrichment;
+            if (e.active) {
+              const secs = Math.max(0, Math.ceil(e.remaining));
+              const mm = Math.floor(secs / 60);
+              const ss = secs % 60;
+              elEnrichStatus.textContent = `富集中: ${e.target} Pa，剩余 ${mm}分${ss}秒`;
+              elEnrichStatus.className = "badge badge-active";
+            } else {
+              elEnrichStatus.textContent = "未开启";
+              elEnrichStatus.className = "badge badge-idle";
             }
-            currentChart.update("none");
           }
         } catch (e) {
           console.error("解析 WS 消息失败", e);
@@ -838,10 +1082,244 @@
       };
       ws.onclose = () => {
         console.log("WS 断开，3 秒后重连");
+        setConnBadge("实时推送已断开", "offline");
         setTimeout(connectWs, 3000);
       };
       ws.onerror = (e) => console.error("WS 错误", e);
     }
+
+    // ---- 实时质谱图 (TIC / EIC 独立图窗) ----
+    const elEicRange = document.getElementById("eic-range");
+    const elEicChips = document.getElementById("eic-chips");
+    const elTicHint = document.getElementById("tic-hint");
+    const elEicHint = document.getElementById("eic-hint");
+    const elSaveSpectra = document.getElementById("save-spectra");
+    const elSpectraInterval = document.getElementById("spectra-interval");
+    const ticCtx = document.getElementById("tic-chart").getContext("2d");
+    const eicCtx = document.getElementById("eic-chart").getContext("2d");
+
+    const eicColors = [
+      "rgb(16, 185, 129)",
+      "rgb(245, 158, 11)",
+      "rgb(139, 92, 246)",
+      "rgb(236, 72, 153)",
+      "rgb(14, 165, 233)",
+    ];
+
+    let ticChart = null;
+    let eicChart = null;
+    let ticCurve = null;
+    let eicCurves = [];
+    let msLastEnd = 0;
+
+    function msCurveKey(range) {
+      return "mz-" + range.replace(/[^0-9.\-]/g, "");
+    }
+
+    function makeMsChart(ctx) {
+      return new Chart(ctx, {
+        type: "line",
+        data: { datasets: [] },
+        options: {
+          animation: false,
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: { type: "linear", title: { display: true, text: "时间 (min)" } },
+            y: { beginAtZero: true, title: { display: true, text: "信号强度" } },
+          },
+          plugins: { legend: { position: "top" } },
+        },
+      });
+    }
+
+    function addEicCurve(massRange) {
+      const key = msCurveKey(massRange);
+      if (eicCurves.some((c) => c.key === key)) return false;
+      if (!eicChart) eicChart = makeMsChart(eicCtx);
+      const color = eicColors[eicCurves.length % eicColors.length];
+      const dataset = {
+        label: "EIC " + massRange,
+        data: [],
+        borderColor: color,
+        borderWidth: 1.5,
+        fill: false,
+        pointRadius: 0,
+      };
+      eicChart.data.datasets.push(dataset);
+      eicCurves.push({ key, massRange, label: dataset.label, dataset });
+      renderEicChips();
+      return true;
+    }
+
+    function removeEicCurve(key) {
+      const idx = eicCurves.findIndex((c) => c.key === key);
+      if (idx < 0) return;
+      const dsIdx = eicChart.data.datasets.indexOf(eicCurves[idx].dataset);
+      if (dsIdx >= 0) eicChart.data.datasets.splice(dsIdx, 1);
+      eicCurves.splice(idx, 1);
+      renderEicChips();
+      if (eicChart) eicChart.update("none");
+    }
+
+    function renderEicChips() {
+      elEicChips.innerHTML = "";
+      eicCurves.forEach((c) => {
+        const chip = document.createElement("span");
+        chip.className = "eic-chip";
+        chip.innerHTML =
+          `<span class="dot" style="background:${c.dataset.borderColor}"></span>${c.label}`;
+        const del = document.createElement("button");
+        del.type = "button";
+        del.textContent = "×";
+        del.title = "移除该曲线";
+        del.onclick = () => removeEicCurve(c.key);
+        chip.appendChild(del);
+        elEicChips.appendChild(chip);
+      });
+    }
+
+    function appendCurvePoints(dataset, time, intensity) {
+      if (!Array.isArray(time) || !time.length) return false;
+      const pts = time.map((t, i) => ({
+        x: t,
+        y: Array.isArray(intensity) ? intensity[i] : 0,
+      }));
+      dataset.data.push(...pts);
+      if (dataset.data.length > 30000) {
+        dataset.data = dataset.data.slice(-30000);
+      }
+      return true;
+    }
+
+    function resetMsSpectrumData() {
+      msLastEnd = 0;
+      if (ticCurve) ticCurve.dataset.data.length = 0;
+      eicCurves.forEach((c) => {
+        c.dataset.data.length = 0;
+      });
+      if (ticChart) ticChart.update("none");
+      if (eicChart) eicChart.update("none");
+    }
+
+    async function refreshMsSpectrum() {
+      try {
+        const ref = await apiPost("/api/ms-refresh", {});
+        if (!ref.ok) {
+          elTicHint.style.display = "";
+          elEicHint.style.display = "";
+          return;
+        }
+        const newEnd = parseFloat(ref.ms_end_time);
+        if (!Number.isFinite(newEnd)) return;
+
+        elTicHint.style.display = "none";
+        elEicHint.style.display = "none";
+        if (newEnd <= msLastEnd) return;
+
+        const start = msLastEnd;
+        const savePayload = { time: [], tic: [], eics: [] };
+        let hasNewData = false;
+
+        // TIC 固定曲线 (m/z 50-500)
+        if (ticChart && ticCurve) {
+          try {
+            const r = await apiPost("/api/ms-chro-lite", {
+              mass_range: "50-500",
+              start_time: start,
+              end_time: 0,
+            });
+            if (r.ok && appendCurvePoints(ticCurve.dataset, r.time, r.intensity)) {
+              savePayload.time = r.time;
+              savePayload.tic = r.intensity;
+              hasNewData = true;
+            }
+          } catch (e) {
+            console.warn("TIC 拉取失败", e);
+          }
+        }
+
+        // EIC 曲线
+        for (const c of eicCurves) {
+          try {
+            const r = await apiPost("/api/ms-chro-lite", {
+              mass_range: c.massRange,
+              start_time: start,
+              end_time: 0,
+            });
+            if (r.ok && appendCurvePoints(c.dataset, r.time, r.intensity)) {
+              savePayload.eics.push({ mass_range: c.massRange, intensity: r.intensity });
+            }
+          } catch (e) {
+            console.warn(`EIC ${c.massRange} 拉取失败`, e);
+          }
+        }
+
+        msLastEnd = newEnd;
+        if (ticChart) ticChart.update("none");
+        if (eicChart) eicChart.update("none");
+
+        // 方案 B：增量曲线数据自动保存
+        if (hasNewData && savePayload.time.length) {
+          apiPost("/api/ms/curves-append", savePayload).catch((e) =>
+            console.warn("曲线数据保存失败", e)
+          );
+        }
+      } catch (e) {
+        console.warn("实时质谱刷新失败", e);
+      }
+    }
+
+    document.getElementById("btn-add-eic").onclick = () => {
+      const range = elEicRange.value.trim();
+      if (!range) return alert("请输入 EIC 质荷比范围，例如 100-200");
+      if (!/^\d+(\.\d+)?\s*-\s*\d+(\.\d+)?$/.test(range)) {
+        return alert("格式应为：起始-结束，例如 100-200");
+      }
+      if (!addEicCurve(range)) {
+        elStatus.textContent = "该 EIC 曲线已存在";
+        return;
+      }
+      elEicRange.value = "";
+      elStatus.textContent = "已添加 EIC 曲线 " + range;
+    };
+
+    // 固定 TIC 图
+    ticChart = makeMsChart(ticCtx);
+    const ticDataset = {
+      label: "TIC (m/z 50-500)",
+      data: [],
+      borderColor: "rgb(16, 185, 129)",
+      borderWidth: 1.5,
+      fill: false,
+      pointRadius: 0,
+    };
+    ticChart.data.datasets.push(ticDataset);
+    ticCurve = { key: "tic", massRange: "50-500", label: ticDataset.label, dataset: ticDataset };
+
+    // 可选 C：原始谱图快照定时保存（间隔可调，读最新选择值）
+    let spectraCountdown = 0;
+    setInterval(() => {
+      if (!elSaveSpectra.checked) {
+        spectraCountdown = 0;
+        return;
+      }
+      const intervalSec = (parseInt(elSpectraInterval.value || "5", 10) || 5) * 60;
+      spectraCountdown += 5;
+      if (spectraCountdown >= intervalSec) {
+        spectraCountdown = 0;
+        apiPost("/api/ms/spectrum-snapshot", {})
+          .then((r) => {
+            if (r.ok) {
+              elStatus.textContent = `已保存谱图快照: scan ${r.scan_num} (${r.points} 点)`;
+            }
+          })
+          .catch((e) => console.warn("谱图快照保存失败", e));
+      }
+    }, 5000);
+
+    // 定时刷新 TIC / EIC
+    setInterval(refreshMsSpectrum, 5000);
 
     initFromBackend();
     connectWs();

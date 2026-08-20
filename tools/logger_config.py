@@ -2,7 +2,7 @@
 """
 logger_config.py —— 统一日志配置模块
 
-为 backend_server.py 及所有子模块（modbus_host, digital_power 等）提供：
+为 backend_server.py 及所有子模块（modbus_host 等）提供：
 - 同时输出到控制台和文件的日志记录
 - 自动按天轮转，保留最近 30 天
 - 统一的日志格式：[时间] [级别] [模块] 消息

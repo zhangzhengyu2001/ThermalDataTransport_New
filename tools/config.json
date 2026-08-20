@@ -1,5 +1,5 @@
 {
-  "pressure": {
+    "pressure": {
         "stm32": {
             "addr": 1,
             "baudrate": 115200
@@ -14,10 +14,5 @@
         },
         "period": 0.1,
         "history_window": 60.0
-    },
-    "power": {
-        "addr": 1,
-        "baudrate": 9600,
-        "max_voltage": 10000
     }
 }

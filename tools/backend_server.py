@@ -20,13 +20,13 @@ import json
 import urllib.request
 import urllib.error
 
-import serial
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tools.modbus_host import ModbusPressureClient
-from modbus.digital_power import DigitalPowerController
 from tools.logger_config import get_logger, init_logging
 
 # ---- 日志系统初始化 ----
@@ -67,13 +67,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         "period": 0.1,
         "history_window": 60.0,
-    },
-    "power": {
-        "addr": 0x01,
-        "baudrate": 19200,
-        # 数字电源的电压量程（单位：V），用于电压 <-> 寄存器换算
-        # 目前使用的电源量程10kV，请根据实际设备调整
-        "max_voltage": 10000,
     },
 }
 
@@ -225,12 +218,11 @@ def _append_ms_log(
     raw_path: str,
     ms_end_time: str,
     target_pressure: float,
-    voltage: float,
     actual_pressure: float,
     mfc_opening: float,
     last_spectrum_number: str,
 ) -> str:
-    """将当前气压、电压、实际气压、MFC 开度与质谱信息写入日志文件，返回日志文件路径。
+    """将当前气压、实际气压、MFC 开度与质谱信息写入日志文件，返回日志文件路径。
 
     last_spectrum_number 使用字符串存储，便于在获取失败时写入空字符串。
     """
@@ -245,7 +237,6 @@ def _append_ms_log(
         raw_path,
         raw_name,
         target_pressure,
-        voltage,
         actual_pressure,
         mfc_opening,
         last_spectrum_number,
@@ -263,7 +254,6 @@ def _append_ms_log(
                 "raw_path",
                 "raw_name",
                 "target_pressure",
-                "voltage",
                 "actual_pressure",
                 "mfc_opening",
                 "last_spectrum_number",
@@ -275,7 +265,7 @@ def _append_ms_log(
 
 
 def _ms_log_current_if_open() -> str:
-    """记录当前气压、电压状态；若远程 raw 已打开，则先刷新质谱并写入最新时间。"""
+    """记录当前气压状态；若远程 raw 已打开，则先刷新质谱并写入最新时间。"""
     server = ctx.ms_server or ""
     raw_path = ctx.ms_raw_path or ""
     ms_end_time = ""
@@ -295,7 +285,6 @@ def _ms_log_current_if_open() -> str:
         raw_path=raw_path,
         ms_end_time=ms_end_time,
         target_pressure=ctx.current_target,
-        voltage=ctx.current_voltage,
         actual_pressure=ctx.current_filtered,
         mfc_opening=ctx.current_flow_cmd,
         last_spectrum_number=last_spec,
@@ -334,35 +323,28 @@ class ControlContext:
         # (timestamp, filtered, air, target, flow_cmd)
         self._history: List[tuple] = []
 
-        # 电流监控（独立串口，ASCII 文本协议，仅被动接收）
-        # 默认固定波特率 9600，无需前端配置
-        self.current_port: Optional[str] = None
-        self.current_baud: int = 9600
-        self.current_value_a: float = 0.0  # 最新电流值，单位 A
-        # (timestamp, current_a)
-        self._current_history: List[tuple] = []
-        self._current_ser: Optional[serial.Serial] = None
-        self._current_thread: Optional[threading.Thread] = None
-        self._current_stop = threading.Event()
-
         # 串口与线程资源
         self._modbus_cli: Optional[ModbusPressureClient] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
 
-        # 数字电源控制配置
-        power_cfg = CONFIG.get("power", {})
-        self.power_port: Optional[str] = None
-        self.power_baud: int = int(power_cfg.get("baudrate", 19200))
-        self.power_addr: int = int(power_cfg.get("addr", 0x01))
-        self.power_max_voltage: float = float(power_cfg.get("max_voltage", 10000.0))
-        self.current_voltage: float = 0.0
-        self._power: Optional[DigitalPowerController] = None
-
         # 质谱远程文件状态
         self.ms_server: Optional[str] = None
         self.ms_raw_path: Optional[str] = None
         self.ms_open: bool = False
+        # 质谱数据保存文件（打开文件时创建，关闭时重置）
+        self._ms_curve_file: Optional[str] = None
+        self._ms_spectrum_file: Optional[str] = None
+        self._ms_save_lock = threading.Lock()
+
+        # 富集检测模式：设定富集目标气压与时长，结束后自动将目标气压设为 100000 Pa
+        self.enrichment_target: float = 0.0
+        self.enrichment_duration: float = 0.0  # 秒
+        self.enrichment_active: bool = False
+        self.enrichment_start_ts: float = 0.0
+        self._enrichment_stop = threading.Event()
+        self._enrichment_thread = threading.Thread(target=self._enrichment_loop, daemon=True)
+        self._enrichment_thread.start()
 
         # WebSocket 客户端列表
         self._ws_clients: List[WebSocket] = []
@@ -412,148 +394,68 @@ class ControlContext:
             out_max=self.pid_out_max,
         )
 
-    # ---- 电流监控串口 ----
-    def _parse_current_line(self, text: str) -> Optional[float]:
-        """解析电流监控设备返回的一行 ASCII 文本，提取电流值（单位 A）。
+    # ---- 富集检测模式 ----
+    def start_enrichment(self, target: float, duration: float):
+        """一键开启富集检测模式：写入富集目标气压并开始计时。"""
+        if self._modbus_cli is None:
+            raise RuntimeError("STM32 串口未打开")
+        if target <= 0:
+            raise ValueError("富集目标气压必须 > 0")
+        if duration <= 0:
+            raise ValueError("富集时长必须 > 0")
+        self._modbus_cli.write_target_pressure(target)
+        self.current_target = target
+        self.enrichment_target = target
+        self.enrichment_duration = duration
+        self.enrichment_active = True
+        self.enrichment_start_ts = time.time()
+        logger.info("富集检测模式已开启: 目标气压=%.1f Pa, 时长=%.1f s", target, duration)
 
-        按设备固定格式直接按字节下标截取：
+    def stop_enrichment(self):
+        """手动取消富集检测模式（不改变当前目标气压）。"""
+        if self.enrichment_active:
+            logger.info("富集检测模式已手动取消")
+        self.enrichment_active = False
 
-        - 第 2~9 个字节（0-based，包含 2 和 9）为数值字符串，例如 "+000.000"；
-        - 第 10~11 个字节为单位字符串，例如 "uA"、" A" 等；
+    def enrichment_remaining(self) -> float:
+        """返回富集剩余秒数（未开启时为 0）。"""
+        if not self.enrichment_active:
+            return 0.0
+        return max(0.0, self.enrichment_duration - (time.time() - self.enrichment_start_ts))
 
-        示例::
-
-            C:+000.000uA1:00.00000V\r\n
-
-        解析失败返回 None。
-        """
-
-        try:
-            # 确保长度足够
-            if len(text) < 12:
-                return None
-
-            value_str = text[2:10].strip()
-            unit_str = text[10:12].strip()
-            if not value_str or not unit_str:
-                return None
-
-            try:
-                value = float(value_str)
-            except ValueError:
-                return None
-
-            if unit_str == "uA":
-                mul = 1e-6
-            elif unit_str == "mA":
-                mul = 1e-3
-            elif unit_str == " A" or unit_str == "A":
-                # 例如 "A" 或 " A" 等，统一视为 A
-                mul = 1.0
-            else:
-                return None
-
-            return value * mul
-        except Exception:
-            return None
-
-    def open_current(self):
-        """打开电流监控串口，并启动接收线程。
-
-        电流串口仅被动接收 ASCII 文本行，不发送任何查询指令。
-        """
-
-        if not self.current_port:
-            raise RuntimeError("电流串口号未设置")
-        if self._current_ser and self._current_ser.is_open:
-            # 已经打开，直接返回
-            return
-
-        try:
-            self._current_ser = serial.Serial(
-                self.current_port,
-                baudrate=self.current_baud,
-                timeout=1.0,
-            )
-        except Exception as e:
-            self._current_ser = None
-            raise RuntimeError(f"打开电流串口失败: {e}") from e
-
-        # 启动接收线程
-        self._current_stop.clear()
-        self._current_thread = threading.Thread(target=self._current_loop, daemon=True)
-        self._current_thread.start()
-
-    def close_current(self):
-        """关闭电流串口与接收线程。"""
-
-        self._current_stop.set()
-        if self._current_thread:
-            try:
-                self._current_thread.join(timeout=2.0)
-            except Exception:
-                pass
-            self._current_thread = None
-
-        if self._current_ser:
-            try:
-                self._current_ser.close()
-            except Exception:
-                pass
-            self._current_ser = None
-
-    def _current_loop(self):
-        """后台线程：循环从电流串口读取并解析数据。"""
-
-        ser = self._current_ser
-        if ser is None:
-            return
-
-        while not self._current_stop.is_set():
-            try:
-                line = ser.readline()
-                if not line:
-                    continue
-                try:
-                    text = line.decode("ascii", errors="ignore").strip()
-                except Exception:
-                    continue
-                if not text:
-                    continue
-
-                value_a = self._parse_current_line(text)
-                if value_a is None:
-                    continue
-
-                now_ts = time.time()
-                self.current_value_a = value_a
-                self._current_history.append((now_ts, value_a))
-                cutoff = now_ts - self.history_window
-                self._current_history = [item for item in self._current_history if item[0] >= cutoff]
-            except Exception as e:
-                # 读取或解析失败时，仅打印日志并稍作等待，避免线程退出
-                logger.warning("读取或解析电流数据失败: %s", e)
+    def _enrichment_loop(self):
+        """后台线程：富集计时结束后自动将目标气压设置为 100000 Pa。"""
+        fail_count = 0
+        while not self._enrichment_stop.is_set():
+            if not self.enrichment_active:
+                fail_count = 0
                 time.sleep(0.5)
+                continue
 
-    # ---- 数字电源串口 ----
-    def open_power(self):
-        if not self.power_port:
-            raise RuntimeError("电源串口号未设置")
-        if self._power and self._power.ser and self._power.ser.is_open:
-            return
-        self._power = DigitalPowerController(
-            port=self.power_port,
-            addr=self.power_addr,
-            baudrate=self.power_baud,
-        )
+            remaining = self.enrichment_remaining()
+            if remaining > 0:
+                time.sleep(min(0.2, remaining))
+                continue
 
-    def close_power(self):
-        if self._power:
             try:
-                self._power.close()
-            except Exception:
-                pass
-            self._power = None
+                self._modbus_cli.write_target_pressure(100000.0)
+                self.current_target = 100000.0
+                self.enrichment_active = False
+                fail_count = 0
+                logger.info("富集检测模式结束，目标气压已自动设置为 100000 Pa")
+                # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
+                try:
+                    asyncio.run(_ms_log_current_if_open())
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("记录富集结束日志失败: %s", e)
+            except Exception as e:  # noqa: BLE001
+                fail_count += 1
+                logger.error("富集结束后设置目标气压失败(第 %d 次): %s", fail_count, e)
+                if fail_count >= 5:
+                    self.enrichment_active = False
+                    logger.error("富集结束写目标气压连续失败 %d 次，已停止富集模式，请手动设置目标气压", fail_count)
+                else:
+                    time.sleep(2.0)
 
     # ---- 控制线程 ----
     def start_control(self):
@@ -655,7 +557,7 @@ class ControlContext:
     def _broadcast_loop(self):
         """统一广播线程：定期将当前状态通过 WebSocket 推送给所有前端。
 
-        所有监控/控制线程（气压、电流等）只负责更新 ctx 内部状态，
+        所有监控/控制线程只负责更新 ctx 内部状态，
         不直接调用 _broadcast，从而避免多线程重复或竞争广播。
         """
 
@@ -691,9 +593,14 @@ class ControlContext:
             "air_pressure": self.current_air,
             "target_pressure": self.current_target,
             "flow_cmd": self.current_flow_cmd,
-            "current_a": self.current_value_a,
             "period": self.period,
             "mode": "control" if self.current_start_pid else "monitor",
+            "enrichment": {
+                "active": self.enrichment_active,
+                "target": self.enrichment_target,
+                "duration": self.enrichment_duration,
+                "remaining": self.enrichment_remaining(),
+            },
             "pid": {
                 "kp": self.pid_kp,
                 "ki": self.pid_ki,
@@ -729,6 +636,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---- 前端静态页面 (tools/web) ----
+_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+if os.path.isdir(_WEB_DIR):
+    app.mount("/web", StaticFiles(directory=_WEB_DIR, html=True), name="web")
+else:
+    logger.warning("未找到前端静态目录 %s，/web 路由不可用", _WEB_DIR)
+
+
+@app.get("/")
+async def root():
+    """根路径跳转到前端主页面。"""
+    return RedirectResponse("/web/index.html")
+
 
 class TargetBody(BaseModel):
     target: float
@@ -751,22 +671,15 @@ class HistoryWindowBody(BaseModel):
     seconds: float
 
 
+class EnrichmentBody(BaseModel):
+    target: float  # 富集目标气压 (Pa)
+    duration: float  # 富集时长 (秒)
+
+
 class ComConfigBody(BaseModel):
     port: str
     baudrate: int
     addr: Optional[int] = None
-
-
-class CurrentComBody(BaseModel):
-    """电流监控串口配置。
-
-    仅需要端口号，波特率固定为 9600。"""
-
-    port: str
-
-
-class VoltageBody(BaseModel):
-    voltage: float
 
 
 class MsLogBody(BaseModel):
@@ -787,6 +700,12 @@ class MsChroBody(BaseModel):
     mass_range: str  # 质荷比范围，例如 "100-200"
     start_time: Optional[float] = None  # EIC 起始时间 (min)
     end_time: Optional[float] = None  # EIC 结束时间 (min)
+
+
+class MsCurvesBody(BaseModel):
+    time: List[float] = []  # 时间点 (min)
+    tic: List[float] = []  # TIC 强度
+    eics: List[Dict[str, Any]] = []  # [{"mass_range": "...", "intensity": [...]}]
 
 
 @app.post("/api/reload-pid")
@@ -846,16 +765,11 @@ async def get_state():
         "stm32": {"port": ctx.stm32_port, "baud": ctx.stm32_baud, "addr": ctx.stm32_addr},
         "monitor_only": ctx.current_start_pid == 0,
         "history_window": ctx.history_window,
-        "power": {
-            "port": ctx.power_port,
-            "baud": ctx.power_baud,
-            "addr": ctx.power_addr,
-            "max_voltage": ctx.power_max_voltage,
-            "current_voltage": ctx.current_voltage,
-        },
-        "current": {
-            "port": ctx.current_port,
-            "baud": ctx.current_baud,
+        "enrichment": {
+            "active": ctx.enrichment_active,
+            "target": ctx.enrichment_target,
+            "duration": ctx.enrichment_duration,
+            "remaining": ctx.enrichment_remaining(),
         },
         "ms": {
             "server": ctx.ms_server,
@@ -883,6 +797,36 @@ async def set_target(body: TargetBody):
     except Exception as e:  # noqa: BLE001
         logger.warning("记录日志失败(设置目标气压): %s", e)
     return {"target": ctx.current_target}
+
+
+@app.post("/api/enrichment/start")
+async def api_enrichment_start(body: EnrichmentBody):
+    """一键开启富集检测模式：设置富集目标气压与时长并开始计时。
+
+    富集结束后会自动将目标气压设置为 100000 Pa。
+    """
+    ctx.start_enrichment(target=float(body.target), duration=float(body.duration))
+    # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
+    try:
+        await asyncio.to_thread(_ms_log_current_if_open)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("记录日志失败(开启富集): %s", e)
+    return {
+        "ok": True,
+        "enrichment": {
+            "active": ctx.enrichment_active,
+            "target": ctx.enrichment_target,
+            "duration": ctx.enrichment_duration,
+            "remaining": ctx.enrichment_remaining(),
+        },
+    }
+
+
+@app.post("/api/enrichment/stop")
+async def api_enrichment_stop():
+    """手动取消富集检测模式（不改变当前目标气压）。"""
+    ctx.stop_enrichment()
+    return {"ok": True, "enrichment": {"active": False}}
 
 
 @app.post("/api/pid")
@@ -937,7 +881,6 @@ async def set_history_window(body: HistoryWindowBody):
     now_ts = time.time()
     cutoff = now_ts - ctx.history_window
     ctx._history = [item for item in ctx._history if item[0] >= cutoff]
-    ctx._current_history = [item for item in ctx._current_history if item[0] >= cutoff]
     return {"history_window": ctx.history_window}
 
 
@@ -952,63 +895,6 @@ async def api_open_stm32(body: ComConfigBody):
     return {"ok": True, "port": ctx.stm32_port, "baud": ctx.stm32_baud, "addr": ctx.stm32_addr}
 
 
-@app.post("/api/open-power")
-async def api_open_power(body: ComConfigBody):
-    """打开数字电源串口。
-
-    前端仅需要提供串口号，波特率和地址从配置文件读取。
-    """
-    ctx.power_port = body.port
-    # 波特率、地址均以配置文件为准，此处忽略 body 中的设置
-    ctx.open_power()
-    return {"ok": True, "port": ctx.power_port, "baud": ctx.power_baud, "addr": ctx.power_addr}
-
-
-@app.post("/api/close-power")
-async def api_close_power():
-    ctx.close_power()
-    return {"ok": True}
-
-
-@app.post("/api/open-current")
-async def api_open_current(body: CurrentComBody):
-    """打开电流监控串口。
-
-    协议为明文 ASCII，仅监听接收数据，不发送任何指令。"""
-
-    ctx.current_port = body.port
-    ctx.open_current()
-    return {"ok": True, "port": ctx.current_port, "baud": ctx.current_baud}
-
-
-@app.post("/api/close-current")
-async def api_close_current():
-    """关闭电流监控串口。"""
-
-    ctx.close_current()
-    return {"ok": True}
-
-
-@app.post("/api/power/voltage")
-async def api_set_power_voltage(body: VoltageBody):
-    """设置数字电源输出电压。"""
-    if ctx._power is None:
-        raise RuntimeError("电源串口未打开")
-    v = float(body.voltage)
-    if v < 0:
-        raise ValueError("目标电压必须 >= 0")
-    if v > ctx.power_max_voltage:
-        raise ValueError(f"目标电压不能超过量程 {ctx.power_max_voltage} V")
-    reg = ctx._power.set_voltage(v, max_range_v=ctx.power_max_voltage)
-    ctx.current_voltage = v
-    # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
-    try:
-        await asyncio.to_thread(_ms_log_current_if_open)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("记录日志失败(设置目标电压): %s", e)
-    return {"voltage": ctx.current_voltage, "register": reg}
-
-
 @app.post("/api/ms-log")
 async def api_ms_log(body: MsLogBody):
     """远程调用 MSHTTPFastAPI 刷新指定 raw 文件并写入日志。
@@ -1017,7 +903,7 @@ async def api_ms_log(body: MsLogBody):
     1. 在 MS 服务器上 Open(raw_path)
     2. 调用 RefreshViewOfFile
     3. 调用 GetEndTime 获取质谱最新时间
-    4. 将当前目标气压、数字电源电压、raw 文件名和质谱时间写入本地日志
+    4. 将当前目标气压、实际气压、raw 文件名和质谱时间写入本地日志
     """
 
     server = (body.server or ctx.ms_server or "").strip()
@@ -1050,7 +936,6 @@ async def api_ms_log(body: MsLogBody):
         raw_path=raw_path,
         ms_end_time=ms_end_time,
         target_pressure=ctx.current_target,
-        voltage=ctx.current_voltage,
         actual_pressure=ctx.current_filtered,
         mfc_opening=ctx.current_flow_cmd,
         last_spectrum_number=last_spec,
@@ -1061,7 +946,6 @@ async def api_ms_log(body: MsLogBody):
         "ms_end_time": ms_end_time,
         "log_path": log_path,
         "target_pressure": ctx.current_target,
-        "voltage": ctx.current_voltage,
     }
 
 
@@ -1127,6 +1011,13 @@ async def api_ms_open(body: MsLogBody):
         ctx.ms_server = server
         ctx.ms_raw_path = raw_path
         ctx.ms_open = True
+        # 为本次打开的 raw 文件建立曲线/谱图保存文件
+        os.makedirs("data", exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        stem = os.path.splitext(os.path.basename(raw_path))[0]
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem) or "raw"
+        ctx._ms_curve_file = os.path.join("data", f"ms_curves_{safe}_{ts}.csv")
+        ctx._ms_spectrum_file = os.path.join("data", f"ms_spectra_{safe}_{ts}.csv")
 
     return {"ok": ok, "open_result": open_res}
 
@@ -1149,7 +1040,90 @@ async def api_ms_close():
     ctx.ms_server = None
     ctx.ms_raw_path = None
     ctx.ms_open = False
+    ctx._ms_curve_file = None
+    ctx._ms_spectrum_file = None
     return {"ok": True}
+
+
+@app.post("/api/ms/curves-append")
+async def api_ms_curves_append(body: MsCurvesBody):
+    """方案 B：追加保存增量 TIC/EIC 曲线数据（长表格式 CSV）。"""
+    if not ctx.ms_open or not ctx._ms_curve_file:
+        raise RuntimeError("尚未打开远程谱图，无法保存曲线数据")
+
+    times = [float(x) for x in body.time]
+    if not times:
+        return {"ok": True, "saved": 0}
+
+    os.makedirs("data", exist_ok=True)
+    is_new = not os.path.exists(ctx._ms_curve_file)
+    rows = 0
+    with ctx._ms_save_lock:
+        with open(ctx._ms_curve_file, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            if is_new:
+                writer.writerow(["time_min", "series", "intensity"])
+            tic = list(body.tic)
+            if len(tic) == len(times):
+                for t, v in zip(times, tic):
+                    writer.writerow([f"{t:.4f}", "TIC", f"{v}"])
+                rows += len(times)
+            for e in body.eics:
+                label = f"EIC {e.get('mass_range', '')}"
+                vals = list(e.get("intensity") or [])
+                if len(vals) == len(times):
+                    for t, v in zip(times, vals):
+                        writer.writerow([f"{t:.4f}", label, f"{v}"])
+                    rows += len(times)
+    logger.info("已追加 %d 行质谱曲线数据到 %s", rows, ctx._ms_curve_file)
+    return {"ok": True, "saved": rows}
+
+
+@app.post("/api/ms/spectrum-snapshot")
+async def api_ms_spectrum_snapshot():
+    """方案 C：保存最新一张谱图的完整 m/z-强度数据。"""
+    if not ctx.ms_open or not ctx._ms_spectrum_file:
+        raise RuntimeError("尚未打开远程谱图，无法保存谱图快照")
+
+    server = ctx.ms_server or ""
+    host = server.strip()
+    if host.startswith("http://"):
+        host = host[len("http://") :]
+    if host.startswith("https://"):
+        host = host[len("https://") :]
+    base_url = f"http://{host}:8899"
+
+    # 1) 获取最新谱图号
+    try:
+        spec_num = await asyncio.to_thread(_ms_get_last_spectrum_number, server)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"获取最新谱图号失败: {e}") from e
+
+    # 2) 拉取该谱图的 m/z 与强度数组
+    payload: Dict[str, Any] = {"argsNames": [], "args": [spec_num]}
+    res = await asyncio.to_thread(_ms_http_post, base_url, "GetMassListFromScanNum", payload)
+    if res.get("DataType") != 2:
+        raise RuntimeError(f"远程 GetMassListFromScanNum 调用失败: {res.get('error')}")
+    rlist = res.get("res") or []
+    if len(rlist) < 2:
+        raise RuntimeError("GetMassListFromScanNum 返回格式不正确")
+    mz = rlist[0]
+    sig = rlist[1]
+    if not isinstance(mz, list) or not isinstance(sig, list) or len(mz) != len(sig):
+        raise RuntimeError("GetMassListFromScanNum 返回的数据长度不一致")
+
+    os.makedirs("data", exist_ok=True)
+    is_new = not os.path.exists(ctx._ms_spectrum_file)
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    with ctx._ms_save_lock:
+        with open(ctx._ms_spectrum_file, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            if is_new:
+                writer.writerow(["recorded_at", "scan_num", "mz", "intensity"])
+            for m, s in zip(mz, sig):
+                writer.writerow([now_str, spec_num, m, s])
+    logger.info("已保存谱图快照 scan=%d (%d 点) 到 %s", spec_num, len(mz), ctx._ms_spectrum_file)
+    return {"ok": True, "scan_num": spec_num, "points": len(mz)}
 
 
 @app.post("/api/ms-refresh")
@@ -1338,40 +1312,6 @@ async def api_save_data():
     return {"ok": True}
 
 
-@app.post("/api/save-current-data")
-async def api_save_current_data():
-    """前端点击“保存电流数据”时调用：
-
-    将当前电流历史窗口内的数据一次性写入 CSV 文件，并附带当前连接的远程质谱文件名（若存在）。
-    """
-
-    if not ctx._current_history:
-        logger.info("当前电流历史缓冲区为空，未生成文件")
-        return {"ok": False, "empty": True}
-
-    os.makedirs("data", exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    raw_name = os.path.basename(ctx.ms_raw_path) if ctx.ms_raw_path else ""
-    filename = os.path.join("data", f"current_{ts}.csv")
-    try:
-        with open(filename, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow([
-                "timestamp",
-                "current_A",
-                "ms_raw_name",
-            ])
-            for item in ctx._current_history:
-                t, cur_a = item
-                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
-                writer.writerow([ts_str, cur_a, raw_name])
-        logger.info("已将 %d 条电流数据保存到 %s", len(ctx._current_history), filename)
-        return {"ok": True, "path": filename, "ms_raw_name": raw_name}
-    except Exception as e:  # noqa: BLE001
-        logger.error("保存电流数据失败: %s", e)
-        return {"ok": False, "error": str(e)}
-
-
 @app.post("/api/monitor-on")
 async def api_monitor_on():
     """启用仅监测模式：对应 STM32 中 start_pid = 0。"""
@@ -1404,8 +1344,7 @@ async def api_monitor_off():
 async def api_health():
     """设备连接健康检查接口。
 
-    返回 STM32 通信状态、电流监控状态、电源连接状态等，
-    供前端判断通信是否正常。
+    返回 STM32 通信状态等，供前端判断通信是否正常。
     """
     health = {
         "stm32": {
@@ -1414,22 +1353,13 @@ async def api_health():
             "healthy": ctx._modbus_cli.is_healthy() if ctx._modbus_cli else False,
             "consecutive_errors": ctx._modbus_cli.consecutive_errors if ctx._modbus_cli else -1,
         },
-        "power": {
-            "port": ctx.power_port,
-            "open": bool(ctx._power and ctx._power.ser and ctx._power.ser.is_open),
-        },
-        "current": {
-            "port": ctx.current_port,
-            "open": bool(ctx._current_ser and ctx._current_ser.is_open),
-        },
         "ms": {
             "server": ctx.ms_server,
             "open": ctx.ms_open,
         },
     }
     overall = health["stm32"]["open"]
-    logger.debug("健康检查: stm32=%s, power=%s, current=%s",
-                 health["stm32"]["healthy"], health["power"]["open"], health["current"]["open"])
+    logger.debug("健康检查: stm32=%s", health["stm32"]["healthy"])
     return {"ok": overall, "health": health}
 
 
