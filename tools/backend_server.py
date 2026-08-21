@@ -67,6 +67,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         "period": 0.1,
         "history_window": 60.0,
+        # 仅检测模式下是否主动写 0x0020 触发滤波气压刷新（部分固件需要）
+        "trigger_refresh": False,
     },
 }
 
@@ -301,6 +303,7 @@ class ControlContext:
         # 采样周期（秒），仅用于上位机轮询刷新频率；
         # 实际控制周期在 STM32 固定为 100 ms。
         self.period: float = float(pressure_cfg.get("period", 0.1))
+        self.trigger_refresh: bool = bool(pressure_cfg.get("trigger_refresh", False))
 
         # 当前状态（从 STM32 寄存器读出）
         self.current_filtered: float = 0.0
@@ -512,6 +515,13 @@ class ControlContext:
         while not self._stop_flag.is_set() and self._modbus_cli:
             t0 = time.time()
             try:
+                # 可选：仅检测模式下主动写 0x0020 触发滤波气压刷新（部分固件需要）
+                if self.trigger_refresh and self.current_start_pid == 0:
+                    try:
+                        self._modbus_cli.trigger_pressure_update()
+                        time.sleep(0.01)
+                    except Exception:
+                        pass
                 # 直接从 STM32 读取当前滤波气压、原始气压、目标值与阀门开度
                 filtered, air, target, flow_cmd, start_pid = self._modbus_cli.read_all_states()
                 self.current_filtered = filtered
@@ -535,6 +545,13 @@ class ControlContext:
                 # 连续错误过多时发出警告
                 if cons_err >= 3:
                     logger.warning("STM32 通信连续失败 %d 次，请检查串口连接和 STM32 状态！", cons_err)
+                # 连续失败达到阈值时自动重开串口，强制恢复帧同步
+                if cons_err >= 5 and self._modbus_cli:
+                    logger.warning("STM32 连续失败 %d 次，尝试重新打开串口恢复通信...", cons_err)
+                    try:
+                        self._modbus_cli.reset_and_reopen()
+                    except Exception as re:  # noqa: BLE001
+                        logger.error("重开串口失败: %s", re)
                 time.sleep(self.period)
                 continue
 
@@ -723,7 +740,7 @@ async def api_reload_pid():
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     # 将当前 PID 参数写入 STM32
-    ctx.apply_pid_to_stm32()
+    await asyncio.to_thread(ctx.apply_pid_to_stm32)
     return {
         "pid": {
             "kp": ctx.pid_kp,
@@ -794,7 +811,7 @@ async def set_target(body: TargetBody):
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     try:
-        ctx._modbus_cli.write_target_pressure(t)
+        await asyncio.to_thread(ctx._modbus_cli.write_target_pressure, t)
     except Exception as e:
         logger.error("写入目标气压失败: %s", e)
         return {"error": str(e)}
@@ -813,7 +830,7 @@ async def api_enrichment_start(body: EnrichmentBody):
 
     富集结束后会自动将目标气压设置为 100000 Pa。
     """
-    ctx.start_enrichment(target=float(body.target), duration=float(body.duration))
+    await asyncio.to_thread(ctx.start_enrichment, float(body.target), float(body.duration))
     # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
     try:
         await asyncio.to_thread(_ms_log_current_if_open)
@@ -859,7 +876,7 @@ async def set_pid(body: PIDBody):
         raise RuntimeError("STM32 串口未打开")
 
     # 通过 Modbus 写入 STM32 端 PID 参数寄存器：
-    ctx.apply_pid_to_stm32()
+    await asyncio.to_thread(ctx.apply_pid_to_stm32)
     return {
         "pid": {
             "kp": ctx.pid_kp,
@@ -899,7 +916,7 @@ async def api_open_stm32(body: ComConfigBody):
     ctx.stm32_baud = body.baudrate
     if body.addr is not None:
         ctx.stm32_addr = body.addr
-    ctx.open_stm32()
+    await asyncio.to_thread(ctx.open_stm32)
     return {"ok": True, "port": ctx.stm32_port, "baud": ctx.stm32_baud, "addr": ctx.stm32_addr}
 
 
@@ -1273,7 +1290,7 @@ async def api_open_mfc(body: ComConfigBody):
 @app.post("/api/close-stm32")
 async def api_close_stm32():
     logger.info("API: 关闭 STM32 串口 (port=%s)", ctx.stm32_port)
-    ctx.close_stm32()
+    await asyncio.to_thread(ctx.close_stm32)
     return {"ok": True}
 
 
@@ -1290,7 +1307,7 @@ async def api_start():
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     try:
-        ctx._modbus_cli.write_start_pid(1)
+        await asyncio.to_thread(ctx._modbus_cli.write_start_pid, 1)
     except Exception as e:
         logger.error("写入 start_pid=1 失败: %s", e)
         return {"ok": False, "error": str(e)}
@@ -1305,7 +1322,7 @@ async def api_stop():
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     try:
-        ctx._modbus_cli.write_start_pid(0)
+        await asyncio.to_thread(ctx._modbus_cli.write_start_pid, 0)
     except Exception as e:
         logger.error("写入 start_pid=0 失败: %s", e)
         return {"ok": False, "error": str(e)}
@@ -1326,11 +1343,14 @@ async def api_monitor_on():
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     try:
-        ctx._modbus_cli.write_start_pid(0)
+        await asyncio.to_thread(ctx._modbus_cli.write_start_pid, 0)
     except Exception as e:
         logger.error("写入 start_pid=0 失败 (monitor-on): %s", e)
         return {"ok": False, "error": f"Failed to write start_pid to STM32: {e}"}
     ctx.current_start_pid = 0
+    # 仅检测模式也需要持续轮询读取气压：
+    # 若读取线程未运行（例如刚停止控制），这里启动它，保证前端实时更新
+    ctx.start_control()
     return {"monitor_only": True}
 
 
@@ -1340,7 +1360,7 @@ async def api_monitor_off():
     if ctx._modbus_cli is None:
         raise RuntimeError("STM32 串口未打开")
     try:
-        ctx._modbus_cli.write_start_pid(1)
+        await asyncio.to_thread(ctx._modbus_cli.write_start_pid, 1)
     except Exception as e:
         logger.error("写入 start_pid=1 失败 (monitor-off): %s", e)
         return {"ok": False, "error": f"Failed to write start_pid to STM32: {e}"}

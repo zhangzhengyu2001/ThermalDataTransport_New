@@ -25,6 +25,7 @@
 import argparse
 import struct
 import sys
+import threading
 import time
 from typing import Tuple, List, Optional
 
@@ -66,36 +67,56 @@ class ModbusPressureClient:
         self._ser: Optional[serial.Serial] = None
         self._retries = max(1, retries)  # 默认重试 3 次
         self._consecutive_errors: int = 0  # 连续错误计数，用于健康监测
+        self._io_lock = threading.RLock()  # 串口读写互斥锁，防止多线程帧交叉
 
     # -------------------- 公共接口 --------------------
     def open(self) -> None:
         """打开串口。"""
-        if self._ser and self._ser.is_open:
-            logger.debug("串口 %s 已处于打开状态，跳过", self.port_name)
-            return
-        logger.info("正在打开串口 %s (波特率=%d, 地址=0x%02X, 超时=%.2fs)",
-                     self.port_name, self.baudrate, self.addr, self.timeout)
-        self._ser = serial.Serial(
-            port=self.port_name,
-            baudrate=self.baudrate,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=self.timeout,
-        )
-        logger.info("串口 %s 打开成功", self.port_name)
-        self._consecutive_errors = 0
+        with self._io_lock:
+            if self._ser and self._ser.is_open:
+                logger.debug("串口 %s 已处于打开状态，跳过", self.port_name)
+                return
+            logger.info("正在打开串口 %s (波特率=%d, 地址=0x%02X, 超时=%.2fs)",
+                         self.port_name, self.baudrate, self.addr, self.timeout)
+            self._ser = serial.Serial(
+                port=self.port_name,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.timeout,
+            )
+            logger.info("串口 %s 打开成功", self.port_name)
+            self._consecutive_errors = 0
 
     def close(self) -> None:
         """关闭串口。"""
-        if self._ser:
-            try:
-                self._ser.close()
-                logger.info("串口 %s 已关闭 (连续错误=%d)", self.port_name, self._consecutive_errors)
-            except Exception as e:
-                logger.warning("关闭串口 %s 时异常: %s", self.port_name, e)
-            finally:
+        with self._io_lock:
+            if self._ser:
+                try:
+                    self._ser.close()
+                    logger.info("串口 %s 已关闭 (连续错误=%d)", self.port_name, self._consecutive_errors)
+                except Exception as e:
+                    logger.warning("关闭串口 %s 时异常: %s", self.port_name, e)
+                finally:
+                    self._ser = None
+
+    def reset_and_reopen(self) -> None:
+        """连续通信失败时调用：清空收发缓冲并重新打开串口，强制恢复帧同步。"""
+        with self._io_lock:
+            if self._ser:
+                try:
+                    if self._ser.is_open:
+                        self._ser.reset_input_buffer()
+                        self._ser.reset_output_buffer()
+                        self._ser.close()
+                except Exception:
+                    pass
                 self._ser = None
+            time.sleep(0.2)
+            self._consecutive_errors = 0
+            self.open()
+            logger.info("串口 %s 已重新打开，通信状态已复位", self.port_name)
 
     def __enter__(self):
         self.open()
@@ -270,6 +291,8 @@ class ModbusPressureClient:
         rx_crc = rsp[-2] | (rsp[-1] << 8)
         if calc != rx_crc:
             raise IOError("CRC 校验失败（读）")
+        # 完整校验通过，本次事务成功，清零连续错误
+        self._consecutive_errors = 0
 
         regs: List[int] = []
         data = rsp[3:-2]
@@ -296,6 +319,8 @@ class ModbusPressureClient:
         rsp = self._send_and_recv_exact(req, 8)
         if rsp != req:
             raise IOError("写单寄存器回显不一致")
+        # 校验通过，本次事务成功，清零连续错误
+        self._consecutive_errors = 0
 
     def write_multiple_registers(self, start: int, values: List[int]) -> None:
         """写多个寄存器（功能码 0x10）。values 为 16 位列表。"""
@@ -335,6 +360,8 @@ class ModbusPressureClient:
         rx_crc = rsp[-2] | (rsp[-1] << 8)
         if calc != rx_crc:
             raise IOError("写多寄存器 CRC 校验失败")
+        # 校验通过，本次事务成功，清零连续错误
+        self._consecutive_errors = 0
 
     # -------------------- 内部工具函数 --------------------
     def _ensure_open(self) -> serial.Serial:
@@ -357,63 +384,68 @@ class ModbusPressureClient:
             expect_len: 期望的响应帧总字节数
             retries: 最大重试次数，None 则使用实例默认值
         """
-        max_retries = retries if retries is not None else self._retries
-        ser = self._ensure_open()
-
-        last_exc: Exception | None = None
-        for attempt in range(max_retries):
+        with self._io_lock:
+            max_retries = retries if retries is not None else self._retries
             try:
-                # 仅清空可能残留的旧数据（而非每次无差别 reset）
-                if ser.in_waiting > 0:
-                    discarded = ser.read(ser.in_waiting)
-                    logger.debug("串口 %s 清空残留数据 %d 字节: %s",
-                                 self.port_name, len(discarded), discarded.hex()[:60])
-
-                ser.write(req)
-                ser.flush()
-
-                deadline = time.time() + (ser.timeout or 1.0)
-                buf = bytearray()
-                while len(buf) < expect_len and time.time() < deadline:
-                    chunk = ser.read(expect_len - len(buf))
-                    if chunk:
-                        buf.extend(chunk)
-                    else:
-                        time.sleep(0.002)  # 缩短轮询间隔，改善响应速度
-
-                if len(buf) != expect_len:
-                    raise TimeoutError(
-                        f"串口超时：期望 {expect_len} 字节，实际收到 {len(buf)} 字节"
-                        f" (尝试 {attempt + 1}/{max_retries})"
-                    )
-
-                # 成功则重置连续错误计数
-                self._consecutive_errors = 0
-                if attempt > 0:
-                    logger.info("串口 %s 在第 %d 次重试后成功 (请求 %s)",
-                                self.port_name, attempt + 1, req[:4].hex())
-                return bytes(buf)
-
+                ser = self._ensure_open()
             except Exception as e:
-                last_exc = e
                 self._consecutive_errors += 1
-                logger.debug("串口 %s 通信失败 (尝试 %d/%d): %s",
-                             self.port_name, attempt + 1, max_retries, e)
-                if attempt < max_retries - 1:
-                    # 重试前等待一小段时间，让设备恢复
-                    time.sleep(0.05 * (attempt + 1))
-                    # 重试前清空缓冲区
-                    try:
-                        if ser.in_waiting > 0:
-                            ser.reset_input_buffer()
-                    except Exception:
-                        pass
+                raise
 
-        # 所有重试均失败
-        logger.error("串口 %s 通信彻底失败 (%d/%d 次): %s | 连续错误=%d",
-                     self.port_name, max_retries, max_retries, last_exc,
-                     self._consecutive_errors)
-        raise last_exc  # type: ignore[misc]
+            last_exc: Exception | None = None
+            for attempt in range(max_retries):
+                try:
+                    # 仅清空可能残留的旧数据（而非每次无差别 reset）
+                    if ser.in_waiting > 0:
+                        discarded = ser.read(ser.in_waiting)
+                        logger.debug("串口 %s 清空残留数据 %d 字节: %s",
+                                     self.port_name, len(discarded), discarded.hex()[:60])
+
+                    ser.write(req)
+                    ser.flush()
+
+                    deadline = time.time() + (ser.timeout or 1.0)
+                    buf = bytearray()
+                    while len(buf) < expect_len and time.time() < deadline:
+                        chunk = ser.read(expect_len - len(buf))
+                        if chunk:
+                            buf.extend(chunk)
+                        else:
+                            time.sleep(0.002)  # 缩短轮询间隔，改善响应速度
+
+                    if len(buf) != expect_len:
+                        raise TimeoutError(
+                            f"串口超时：期望 {expect_len} 字节，实际收到 {len(buf)} 字节"
+                            f" (尝试 {attempt + 1}/{max_retries})"
+                        )
+
+                    # 注意：连续错误计数在调用方完成完整校验后清零，
+                    # 这里只负责传输层，避免“响应头异常/CRC 失败”被漏计
+                    if attempt > 0:
+                        logger.info("串口 %s 在第 %d 次重试后成功 (请求 %s)",
+                                    self.port_name, attempt + 1, req[:4].hex())
+                    return bytes(buf)
+
+                except Exception as e:
+                    last_exc = e
+                    logger.debug("串口 %s 通信失败 (尝试 %d/%d): %s",
+                                 self.port_name, attempt + 1, max_retries, e)
+                    if attempt < max_retries - 1:
+                        # 重试前等待一小段时间，让设备恢复
+                        time.sleep(0.05 * (attempt + 1))
+                        # 重试前清空缓冲区
+                        try:
+                            if ser.in_waiting > 0:
+                                ser.reset_input_buffer()
+                        except Exception:
+                            pass
+
+            # 所有重试均失败，计一次连续错误
+            self._consecutive_errors += 1
+            logger.error("串口 %s 通信彻底失败 (%d/%d 次): %s | 连续错误=%d",
+                         self.port_name, max_retries, max_retries, last_exc,
+                         self._consecutive_errors)
+            raise last_exc  # type: ignore[misc]
 
     @staticmethod
     def _crc16_modbus(data: bytes) -> int:
