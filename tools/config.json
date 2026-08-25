@@ -13,6 +13,13 @@
             "out_max": 1.0
         },
         "period": 0.1,
-        "history_window": 60.0
+        "history_window": 60.0,
+        "enrichment_ramp_step": 2000.0,
+        "enrichment_fine_switch": 1000.0,
+        "enrichment_fine_step": 200.0,
+        "enrichment_fast_vent": true,
+        "enrichment_vent_overshoot": 100000.0,
+        "enrichment_vent_close_margin": 500.0,
+        "enrichment_vent_timeout": 300.0
     }
 }

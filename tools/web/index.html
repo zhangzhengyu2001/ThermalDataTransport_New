@@ -362,15 +362,23 @@
           <input id="enrich-target" type="number" step="1" value="1000" class="field" />
         </div>
         <div class="row">
-          <label>时长 (分钟)</label>
-          <input id="enrich-minutes" type="number" step="1" value="30" class="field" />
+          <label>时长</label>
+          <input id="enrich-minutes" type="number" step="1" min="0" value="30" class="field-sm" />
+          <span class="hint">分</span>
+          <input id="enrich-seconds" type="number" step="1" min="0" max="59" value="0" class="field-sm" />
+          <span class="hint">秒</span>
+        </div>
+        <div class="row">
+          <label>补气步长 (Pa/级)</label>
+          <input id="enrich-ramp-step" type="number" step="100" min="0" value="2000" class="field" />
+          <span class="hint">0 = 直接设目标</span>
         </div>
         <div class="row start">
           <button class="btn btn-primary" id="btn-enrich-start">开启富集</button>
           <button class="btn" id="btn-enrich-stop">取消</button>
         </div>
         <div class="row-hint">
-          <span class="hint">计时结束后自动将目标气压设置为 100000 Pa</span>
+          <span class="hint">气压达到目标 (±500 Pa) 后开始计时；结束后自动大气流吹扫</span>
           <span class="badge badge-idle" id="enrich-status">未开启</span>
         </div>
       </section>
@@ -564,12 +572,34 @@
       }
     }
 
+    function updateEnrichmentStatus(e, filtered) {
+      if (!e) return;
+      if (e.active) {
+        if (e.venting) {
+          elEnrichStatus.textContent = `快速补气中: 当前 ${Math.round(filtered || 0)} Pa（目标 100000）`;
+        } else if (e.reached) {
+          const secs = Math.max(0, Math.ceil(e.remaining));
+          const mm = Math.floor(secs / 60);
+          const ss = secs % 60;
+          elEnrichStatus.textContent = `富集中: ${e.target} Pa，剩余 ${mm}分${ss}秒`;
+        } else {
+          elEnrichStatus.textContent = `等待气压达到目标 (±500 Pa): 当前 ${Math.round(filtered || 0)} Pa`;
+        }
+        elEnrichStatus.className = "badge badge-active";
+      } else {
+        elEnrichStatus.textContent = "未开启";
+        elEnrichStatus.className = "badge badge-idle";
+      }
+    }
+
     const elStm32Port = document.getElementById("stm32-port");
     const elStm32Baud = document.getElementById("stm32-baud");
     const elStm32Addr = document.getElementById("stm32-addr");
 
     const elEnrichTarget = document.getElementById("enrich-target");
     const elEnrichMinutes = document.getElementById("enrich-minutes");
+    const elEnrichSeconds = document.getElementById("enrich-seconds");
+    const elEnrichRampStep = document.getElementById("enrich-ramp-step");
     const elEnrichStatus = document.getElementById("enrich-status");
 
     const elMsServer = document.getElementById("ms-server");
@@ -786,14 +816,16 @@
         if (st.stm32.port) elStm32Port.value = st.stm32.port;
         elStm32Baud.value = st.stm32.baud;
         elStm32Addr.value = st.stm32.addr;
-        if (st.enrichment && st.enrichment.active) {
-          elEnrichTarget.value = st.enrichment.target.toFixed(1);
-          elEnrichMinutes.value = (st.enrichment.duration / 60).toFixed(1);
-          const secs = Math.max(0, Math.ceil(st.enrichment.remaining));
-          const mm = Math.floor(secs / 60);
-          const ss = secs % 60;
-          elEnrichStatus.textContent = `富集中: ${st.enrichment.target} Pa，剩余 ${mm}分${ss}秒`;
-          elEnrichStatus.className = "badge badge-active";
+        if (st.enrichment) {
+          updateEnrichmentStatus(st.enrichment, st.filtered);
+          if (st.enrichment.active) {
+            elEnrichTarget.value = st.enrichment.target.toFixed(1);
+            elEnrichMinutes.value = Math.floor(st.enrichment.duration / 60);
+            elEnrichSeconds.value = Math.round(st.enrichment.duration % 60);
+            if (typeof st.enrichment.ramp_step === "number") {
+              elEnrichRampStep.value = st.enrichment.ramp_step;
+            }
+          }
         }
         if (st.monitor_only) {
           elStatus.textContent = "当前为仅监测模式 (start_pid=0)";
@@ -888,15 +920,30 @@
     document.getElementById("btn-enrich-start").onclick = async () => {
       const target = parseFloat(elEnrichTarget.value);
       const minutes = parseFloat(elEnrichMinutes.value);
+      const seconds = parseFloat(elEnrichSeconds.value);
+      const rampStep = parseFloat(elEnrichRampStep.value);
       if (isNaN(target) || target <= 0) return alert("请输入合法的富集目标气压");
-      if (isNaN(minutes) || minutes <= 0) return alert("请输入合法的富集时长");
+      if (isNaN(minutes) || minutes < 0) return alert("请输入合法的富集分钟数");
+      if (isNaN(seconds) || seconds < 0 || seconds >= 60) return alert("富集秒数应在 0~59 之间");
+      const totalSec = minutes * 60 + seconds;
+      if (!(totalSec > 0)) return alert("请输入合法的富集时长");
       try {
         elStatus.textContent = "开启富集检测模式...";
-        const r = await apiPost("/api/enrichment/start", { target, duration: minutes * 60 });
+        const r = await apiPost("/api/enrichment/start", {
+          target,
+          duration: totalSec,
+          ramp_step: isNaN(rampStep) ? 0 : rampStep,
+        });
         elEnrichTarget.value = r.enrichment.target.toFixed(1);
-        elEnrichMinutes.value = (r.enrichment.duration / 60).toFixed(1);
+        elEnrichMinutes.value = Math.floor(r.enrichment.duration / 60);
+        elEnrichSeconds.value = Math.round(r.enrichment.duration % 60);
         elEnrichStatus.className = "badge badge-active";
-        elStatus.textContent = "富集检测已开启，结束后自动设置目标气压为 100000 Pa";
+        if (r.enrichment.reached) {
+          elStatus.textContent = "富集检测已开启（已自动开始控制），正在计时";
+        } else {
+          elEnrichStatus.textContent = "等待气压达到目标 (±500 Pa) 后开始计时";
+          elStatus.textContent = "富集检测已开启（已自动开始控制），等待气压到达目标后开始计时";
+        }
       } catch (e) {
         console.error(e);
         elStatus.textContent = "开启富集检测失败";
@@ -944,7 +991,7 @@
       try {
         elStatus.textContent = "停止控制...";
         await apiPost("/api/stop", {});
-        elStatus.textContent = "控制已停止";
+        elStatus.textContent = "控制已停止，已自动切换至仅检测模式";
       } catch (e) {
         console.error(e);
         elStatus.textContent = "停止控制失败";
@@ -1105,11 +1152,16 @@
       window.open("mz_chro.html", "_blank");
     };
 
+    let wsOpen = false;
+
     function connectWs() {
       const ws = new WebSocket(wsUrl);
       ws.onopen = () => {
         console.log("WS 连接成功");
+        wsOpen = true;
         setConnBadge("实时推送已连接", "online");
+        // 连接/重连后重新同步后端状态，避免重启后页面数值不更新
+        initFromBackend();
       };
       ws.onmessage = (ev) => {
         try {
@@ -1131,19 +1183,7 @@
           }
           chart.update("none");
 
-          if (msg.enrichment) {
-            const e = msg.enrichment;
-            if (e.active) {
-              const secs = Math.max(0, Math.ceil(e.remaining));
-              const mm = Math.floor(secs / 60);
-              const ss = secs % 60;
-              elEnrichStatus.textContent = `富集中: ${e.target} Pa，剩余 ${mm}分${ss}秒`;
-              elEnrichStatus.className = "badge badge-active";
-            } else {
-              elEnrichStatus.textContent = "未开启";
-              elEnrichStatus.className = "badge badge-idle";
-            }
-          }
+          if (msg.enrichment) updateEnrichmentStatus(msg.enrichment, msg.filtered_pressure);
           if (msg.comm) {
             updateCommAlert(msg.comm);
           }
@@ -1153,6 +1193,7 @@
       };
       ws.onclose = () => {
         console.log("WS 断开，3 秒后重连");
+        wsOpen = false;
         setConnBadge("实时推送已断开", "offline");
         setTimeout(connectWs, 3000);
       };
@@ -1427,6 +1468,33 @@
     elLogLevel.onchange = refreshLogs;
     setInterval(refreshLogs, 5000);
     refreshLogs();
+
+    // 状态兜底轮询：WebSocket 未连接时也保证数值/图表更新
+    // （解决后端重启后点击“仅检测/开始控制”但页面不更新、需手动刷新才更新的问题）
+    setInterval(async () => {
+      try {
+        const st = await apiGet("/api/state");
+        if (typeof st.target === "number") {
+          elTargetDisplay.textContent = st.target.toFixed(1);
+        }
+        updateCommAlert(st.comm);
+        updateEnrichmentStatus(st.enrichment, st.filtered);
+        if (!wsOpen && typeof st.filtered === "number") {
+          const t = new Date();
+          chartData.labels.push(t);
+          chartData.datasets[0].data.push(st.filtered);
+          if (typeof st.target === "number") chartData.datasets[1].data.push(st.target);
+          if (chartData.labels.length > maxPoints) {
+            chartData.labels.shift();
+            chartData.datasets[0].data.shift();
+            chartData.datasets[1].data.shift();
+          }
+          chart.update("none");
+        }
+      } catch (e) {
+        // 后端未就绪时静默，等待下一次轮询
+      }
+    }, 3000);
 
     initFromBackend();
     connectWs();

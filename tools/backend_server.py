@@ -69,6 +69,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "history_window": 60.0,
         # 仅检测模式下是否主动写 0x0020 触发滤波气压刷新（部分固件需要）
         "trigger_refresh": False,
+        # 富集两段式渐变：大段步长（Pa/级）
+        "enrichment_ramp_step": 2000.0,
+        # 距目标多少 Pa 时切换为精调小步长
+        "enrichment_fine_switch": 1000.0,
+        # 精调阶段步长（Pa/级）
+        "enrichment_fine_step": 200.0,
+        # 富集结束后快速补气：先写“100000+过压余量”让阀门全开，到 100000-收阀余量 再收阀
+        "enrichment_fast_vent": True,
+        "enrichment_vent_overshoot": 100000.0,
+        "enrichment_vent_close_margin": 500.0,
+        "enrichment_vent_timeout": 300.0,
     },
 }
 
@@ -89,6 +100,9 @@ def load_config() -> Dict[str, Any]:
 
 
 CONFIG = load_config()
+
+# 富集模式：判定“气压已达到目标”的允许误差（Pa）
+ENRICHMENT_PRESSURE_TOLERANCE = 500.0
 
 
 def reload_pid_from_config() -> None:
@@ -304,6 +318,13 @@ class ControlContext:
         # 实际控制周期在 STM32 固定为 100 ms。
         self.period: float = float(pressure_cfg.get("period", 0.1))
         self.trigger_refresh: bool = bool(pressure_cfg.get("trigger_refresh", False))
+        self._enrichment_ramp_step_default: float = float(pressure_cfg.get("enrichment_ramp_step", 2000.0))
+        self._enrichment_fine_switch: float = float(pressure_cfg.get("enrichment_fine_switch", 1000.0))
+        self._enrichment_fine_step: float = float(pressure_cfg.get("enrichment_fine_step", 200.0))
+        self._enrichment_fast_vent: bool = bool(pressure_cfg.get("enrichment_fast_vent", True))
+        self._enrichment_vent_overshoot: float = float(pressure_cfg.get("enrichment_vent_overshoot", 100000.0))
+        self._enrichment_vent_close_margin: float = float(pressure_cfg.get("enrichment_vent_close_margin", 500.0))
+        self._enrichment_vent_timeout: float = float(pressure_cfg.get("enrichment_vent_timeout", 300.0))
 
         # 当前状态（从 STM32 寄存器读出）
         self.current_filtered: float = 0.0
@@ -344,7 +365,12 @@ class ControlContext:
         self.enrichment_target: float = 0.0
         self.enrichment_duration: float = 0.0  # 秒
         self.enrichment_active: bool = False
+        self.enrichment_reached: bool = False  # 气压是否已到达目标（±500 Pa）
         self.enrichment_start_ts: float = 0.0
+        self.enrichment_ramp_step: float = 0.0  # 本次富集的大段步长 (Pa/级)
+        self._enrichment_ramp_current: float = 0.0  # 渐变过程中当前已写入的目标气压
+        self._enrichment_venting: bool = False  # 是否处于结束后的快速补气阶段
+        self._enrichment_vent_start_ts: float = 0.0
         self._enrichment_stop = threading.Event()
         self._enrichment_thread = threading.Thread(target=self._enrichment_loop, daemon=True)
         self._enrichment_thread.start()
@@ -398,48 +424,239 @@ class ControlContext:
         )
 
     # ---- 富集检测模式 ----
-    def start_enrichment(self, target: float, duration: float):
-        """一键开启富集检测模式：写入富集目标气压并开始计时。"""
+    def start_enrichment(self, target: float, duration: float, ramp_step: Optional[float] = None):
+        """一键开启富集检测模式：写入富集目标气压，气压到达目标后才开始计时。
+
+        ramp_step: 渐变补气大段步长 (Pa/级)。None 使用配置默认值；0 表示直接设置目标（不渐变）。
+        """
         if self._modbus_cli is None:
             raise RuntimeError("STM32 串口未打开")
         if target <= 0:
             raise ValueError("富集目标气压必须 > 0")
         if duration <= 0:
             raise ValueError("富集时长必须 > 0")
-        self._modbus_cli.write_target_pressure(target)
-        self.current_target = target
+
+        if ramp_step is None:
+            ramp_step = self._enrichment_ramp_step_default
+        self.enrichment_ramp_step = max(0.0, float(ramp_step))
+
+        # 富集模式即代表开始控制：切换 STM32 至控制模式并确保轮询线程运行
+        try:
+            self._modbus_cli.write_start_pid(1)
+            self.current_start_pid = 1
+            logger.info("富集模式已自动切换 STM32 至控制模式 (start_pid=1)")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("富集模式切换控制模式失败: %s", e)
+        self.start_control()
+
+        # 读取当前气压，判断是否需要渐变补气
+        try:
+            current_pressure, _air, _target, _flow, _pid = self._modbus_cli.read_all_states()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("富集开启时读取当前气压失败，直接使用目标值: %s", e)
+            current_pressure = target
+
         self.enrichment_target = target
         self.enrichment_duration = duration
         self.enrichment_active = True
-        self.enrichment_start_ts = time.time()
-        logger.info("富集检测模式已开启: 目标气压=%.1f Pa, 时长=%.1f s", target, duration)
+        self.enrichment_reached = False
+        self.enrichment_start_ts = 0.0
+        self._enrichment_venting = False
+        self._enrichment_vent_start_ts = 0.0
+
+        if self.enrichment_ramp_step > 0 and current_pressure < target - ENRICHMENT_PRESSURE_TOLERANCE:
+            # 两段式渐变补气：先写入当前气压，随后按大段/精调步长抬升目标
+            self._enrichment_ramp_current = current_pressure
+            self._modbus_cli.write_target_pressure(current_pressure)
+            self.current_target = current_pressure
+            logger.info("富集检测模式已开启: 目标=%.1f Pa, 时长=%.1f s, 两段式渐变(大段%.0f Pa/级, "
+                        "精调%.0f Pa/级, 切换余量%.0f Pa) (当前 %.1f Pa)",
+                        target, duration, self.enrichment_ramp_step,
+                        self._enrichment_fine_step, self._enrichment_fine_switch, current_pressure)
+        else:
+            # 直接写入目标（已接近目标或未启用渐变）
+            self._enrichment_ramp_current = target
+            self._modbus_cli.write_target_pressure(target)
+            self.current_target = target
+            logger.info("富集检测模式已开启: 目标气压=%.1f Pa, 时长=%.1f s, "
+                        "等待气压到达目标(±%.0f Pa)后开始计时",
+                        target, duration, ENRICHMENT_PRESSURE_TOLERANCE)
+
+    def _advance_ramp(self, next_target: float) -> None:
+        """把渐变目标写入 STM32（仅在确实抬升时调用）。"""
+        if next_target > self._enrichment_ramp_current:
+            self._enrichment_ramp_current = next_target
+            self._modbus_cli.write_target_pressure(next_target)
+            self.current_target = next_target
+            logger.info("富集: 渐变目标 -> %.1f Pa", next_target)
 
     def stop_enrichment(self):
         """手动取消富集检测模式（不改变当前目标气压）。"""
         if self.enrichment_active:
             logger.info("富集检测模式已手动取消")
         self.enrichment_active = False
+        self._enrichment_venting = False
 
     def enrichment_remaining(self) -> float:
         """返回富集剩余秒数（未开启时为 0）。"""
-        if not self.enrichment_active:
+        if not self.enrichment_active or not self.enrichment_reached:
             return 0.0
         return max(0.0, self.enrichment_duration - (time.time() - self.enrichment_start_ts))
 
     def _enrichment_loop(self):
-        """后台线程：富集计时结束后自动将目标气压设置为 100000 Pa。"""
+        """后台线程：等待气压到达目标(±500 Pa)后开始计时，结束自动将目标气压设置为 100000 Pa。"""
         fail_count = 0
+        last_wait_log = 0.0
         while not self._enrichment_stop.is_set():
             if not self.enrichment_active:
                 fail_count = 0
                 time.sleep(0.5)
                 continue
 
+            # 阶段 1：等待气压到达目标（±500 Pa），到达后才开始计时
+            if not self.enrichment_reached:
+                try:
+                    filtered, _air, _target, _flow, _pid = self._modbus_cli.read_all_states()
+                    if abs(filtered - self.enrichment_target) <= ENRICHMENT_PRESSURE_TOLERANCE:
+                        self.enrichment_reached = True
+                        self.enrichment_start_ts = time.time()
+                        logger.info("富集: 气压 %.1f Pa 已到达目标 %.1f Pa (±%.0f Pa)，开始计时 %.0f s",
+                                    filtered, self.enrichment_target,
+                                    ENRICHMENT_PRESSURE_TOLERANCE, self.enrichment_duration)
+                    else:
+                        now = time.time()
+                        # 两段式渐变补气
+                        if self.enrichment_ramp_step > 0 and filtered < self.enrichment_target:
+                            remaining = self.enrichment_target - self._enrichment_ramp_current
+                            if remaining > self._enrichment_fine_switch:
+                                # 大段阶段：单向确认——气压到达当前阶梯下方 500 Pa 以内，
+                                # 或已冲过该阶梯，即进入下一级（大步长不会卡在中间值）
+                                if filtered >= self._enrichment_ramp_current - ENRICHMENT_PRESSURE_TOLERANCE:
+                                    self._advance_ramp(
+                                        min(self.enrichment_target,
+                                            self._enrichment_ramp_current + self.enrichment_ramp_step,
+                                            # 粗调最多推进到“目标 - 精调切换余量”，
+                                            # 避免大步长直接跨过精调区导致最后一步超调
+                                            self.enrichment_target - self._enrichment_fine_switch)
+                                    )
+                            else:
+                                # 精调阶段：等压爬升——气压真正进入当前阶梯 ±500 Pa 才进下一级，
+                                # 保证接近目标时阀门开度小、无冲量，避免超调
+                                if abs(filtered - self._enrichment_ramp_current) <= ENRICHMENT_PRESSURE_TOLERANCE:
+                                    self._advance_ramp(
+                                        min(self.enrichment_target,
+                                            self._enrichment_ramp_current + self._enrichment_fine_step)
+                                    )
+                        if now - last_wait_log >= 30.0:
+                            logger.info("富集: 等待气压到达目标，当前 %.1f Pa / 目标 %.1f Pa (渐变目标 %.1f Pa)",
+                                        filtered, self.enrichment_target, self._enrichment_ramp_current)
+                            last_wait_log = now
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("富集: 等待目标气压时读取失败: %s", e)
+                time.sleep(0.5)
+                continue
+
+            # 阶段 2：到达目标后倒计时，结束自动设置 100000 Pa
             remaining = self.enrichment_remaining()
             if remaining > 0:
                 time.sleep(min(0.2, remaining))
                 continue
 
+            if self._modbus_cli is None:
+                logger.error("富集结束时 STM32 串口未打开，无法设置目标气压，请手动设置")
+                self.enrichment_active = False
+                continue
+
+            # 结束动作：确保控制模式。
+            # 写失败时不放弃：持续重试并尝试复位串口，避免“富集结束但不出气”卡住实验。
+            try:
+                self._modbus_cli.write_start_pid(1)
+                self.current_start_pid = 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("富集结束切换控制模式失败(稍后重试): %s", e)
+
+            if self._enrichment_fast_vent and not self._enrichment_venting:
+                # 快速补气：先把目标写到“100000+过压余量”，让 PID 输出饱和、阀门全开，
+                # 以最大流量把气压快速推到大气压
+                vent_target = 100000.0 + self._enrichment_vent_overshoot
+                try:
+                    self._modbus_cli.write_target_pressure(vent_target)
+                    self.current_target = vent_target
+                    self._enrichment_venting = True
+                    self._enrichment_vent_start_ts = time.time()
+                    logger.info("富集结束，快速补气开始：目标 %.0f Pa（阀门全开）", vent_target)
+                except Exception as e:  # noqa: BLE001
+                    fail_count += 1
+                    logger.error("富集结束后设置快速补气目标失败(第 %d 次): %s", fail_count, e)
+                    if fail_count in (5, 15, 30):
+                        logger.warning("富集结束写目标气压持续失败，尝试复位串口后继续重试...")
+                        try:
+                            self._modbus_cli.reset_and_reopen()
+                        except Exception as re:  # noqa: BLE001
+                            logger.error("复位串口失败: %s", re)
+                    time.sleep(2.0)
+                continue
+
+            if self._enrichment_venting:
+                # 等待气压到达 100000 - 收阀余量，然后收阀到 100000
+                try:
+                    filtered, _air, _target, _flow, _pid = self._modbus_cli.read_all_states()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("富集快速补气中读取气压失败: %s", e)
+                    time.sleep(0.5)
+                    continue
+
+                # 超时保护：长时间补不到大气压则按原逻辑收阀结束
+                if time.time() - self._enrichment_vent_start_ts > self._enrichment_vent_timeout:
+                    logger.error("富集快速补气超过 %.0f 秒仍未到达 100000 Pa（当前 %.1f Pa），强制收阀结束",
+                                 self._enrichment_vent_timeout, filtered)
+                    try:
+                        self._modbus_cli.write_target_pressure(100000.0)
+                        self.current_target = 100000.0
+                        self._enrichment_venting = False
+                        self.enrichment_active = False
+                        fail_count = 0
+                        logger.info("富集检测模式结束（超时收阀），目标气压已设置为 100000 Pa")
+                    except Exception as e:  # noqa: BLE001
+                        fail_count += 1
+                        logger.error("富集结束（超时）写 100000 失败(第 %d 次): %s", fail_count, e)
+                        if fail_count in (5, 15, 30):
+                            try:
+                                self._modbus_cli.reset_and_reopen()
+                            except Exception as re:  # noqa: BLE001
+                                logger.error("复位串口失败: %s", re)
+                        time.sleep(2.0)
+                    continue
+
+                if filtered >= 100000.0 - self._enrichment_vent_close_margin:
+                    try:
+                        self._modbus_cli.write_target_pressure(100000.0)
+                        self.current_target = 100000.0
+                        self._enrichment_venting = False
+                        self.enrichment_active = False
+                        fail_count = 0
+                        logger.info("富集检测模式结束，目标气压已设置为 100000 Pa")
+                        # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
+                        try:
+                            asyncio.run(_ms_log_current_if_open())
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("记录富集结束日志失败: %s", e)
+                    except Exception as e:  # noqa: BLE001
+                        fail_count += 1
+                        logger.error("富集结束写 100000 失败(第 %d 次): %s", fail_count, e)
+                        if fail_count in (5, 15, 30):
+                            logger.warning("富集结束写目标气压持续失败，尝试复位串口后继续重试...")
+                            try:
+                                self._modbus_cli.reset_and_reopen()
+                            except Exception as re:  # noqa: BLE001
+                                logger.error("复位串口失败: %s", re)
+                        time.sleep(2.0)
+                    continue
+
+                time.sleep(0.2)
+                continue
+
+            # 未启用快速补气：直接设置目标气压为 100000（原行为）
             try:
                 self._modbus_cli.write_target_pressure(100000.0)
                 self.current_target = 100000.0
@@ -454,15 +671,23 @@ class ControlContext:
             except Exception as e:  # noqa: BLE001
                 fail_count += 1
                 logger.error("富集结束后设置目标气压失败(第 %d 次): %s", fail_count, e)
-                if fail_count >= 5:
-                    self.enrichment_active = False
-                    logger.error("富集结束写目标气压连续失败 %d 次，已停止富集模式，请手动设置目标气压", fail_count)
-                else:
-                    time.sleep(2.0)
+                if fail_count in (5, 15, 30):
+                    logger.warning("富集结束写目标气压持续失败，尝试复位串口后继续重试...")
+                    try:
+                        self._modbus_cli.reset_and_reopen()
+                    except Exception as re:  # noqa: BLE001
+                        logger.error("复位串口失败: %s", re)
+                time.sleep(2.0)
 
     # ---- 控制线程 ----
     def start_control(self):
         if self._thread and self._thread.is_alive():
+            # 旧线程仍存活但停止标志已置位（停止后尚未完全退出）：
+            # 清除停止标志，让现有线程继续轮询，
+            # 避免“仅监测模式”下轮询线程退出导致气压冻结
+            if self._stop_flag.is_set():
+                self._stop_flag.clear()
+                logger.info("已清除停止标志，继续使用现有轮询线程")
             return
         # 仅要求 STM32 串口已打开；
         if not self._modbus_cli:
@@ -473,18 +698,11 @@ class ControlContext:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def stop_control(self):
-        self._stop_flag.set()
-        if self._thread:
-            self._thread.join(timeout=2.0)
-        # 停止后不再更新 _history，此时缓冲区内容即为“停止前 history_window 秒内的数据”
-
     # ---- 数据快照保存 ----
     def save_snapshot(self):
         """将当前内存中的历史数据一次性写入 CSV 文件。
 
-        注意：如果已经调用过 stop_control，则 _history 不会再增长，
-        此时写出的就是“停止控制前 history_window 秒内”的数据。
+        注意：保存的是内存中最近 history_window 秒内的数据。
         """
         if not self._history:
             logger.info("当前历史缓冲区为空，未生成文件")
@@ -614,9 +832,13 @@ class ControlContext:
             "mode": "control" if self.current_start_pid else "monitor",
             "enrichment": {
                 "active": self.enrichment_active,
+                "reached": self.enrichment_reached,
+                "venting": self._enrichment_venting,
                 "target": self.enrichment_target,
                 "duration": self.enrichment_duration,
                 "remaining": self.enrichment_remaining(),
+                "ramp_step": self.enrichment_ramp_step,
+                "ramp_current": self._enrichment_ramp_current,
             },
             "comm": {
                 "open": bool(self._modbus_cli and self._modbus_cli._ser and self._modbus_cli._ser.is_open),
@@ -695,6 +917,7 @@ class HistoryWindowBody(BaseModel):
 class EnrichmentBody(BaseModel):
     target: float  # 富集目标气压 (Pa)
     duration: float  # 富集时长 (秒)
+    ramp_step: Optional[float] = None  # 渐变补气大段步长 (Pa/级)，None 用配置默认值，0 表示不渐变
 
 
 class ComConfigBody(BaseModel):
@@ -774,6 +997,7 @@ async def list_serial_ports():
 async def get_state():
     return {
         "target": ctx.current_target,
+        "filtered": ctx.current_filtered,
         "period": ctx.period,
         "pid": {
             "kp": ctx.pid_kp,
@@ -788,9 +1012,13 @@ async def get_state():
         "history_window": ctx.history_window,
         "enrichment": {
             "active": ctx.enrichment_active,
+            "reached": ctx.enrichment_reached,
+            "venting": ctx._enrichment_venting,
             "target": ctx.enrichment_target,
             "duration": ctx.enrichment_duration,
             "remaining": ctx.enrichment_remaining(),
+            "ramp_step": ctx.enrichment_ramp_step,
+            "ramp_current": ctx._enrichment_ramp_current,
         },
         "comm": {
             "open": bool(ctx._modbus_cli and ctx._modbus_cli._ser and ctx._modbus_cli._ser.is_open),
@@ -830,7 +1058,12 @@ async def api_enrichment_start(body: EnrichmentBody):
 
     富集结束后会自动将目标气压设置为 100000 Pa。
     """
-    await asyncio.to_thread(ctx.start_enrichment, float(body.target), float(body.duration))
+    await asyncio.to_thread(
+        ctx.start_enrichment,
+        float(body.target),
+        float(body.duration),
+        float(body.ramp_step) if body.ramp_step is not None else None,
+    )
     # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
     try:
         await asyncio.to_thread(_ms_log_current_if_open)
@@ -840,9 +1073,13 @@ async def api_enrichment_start(body: EnrichmentBody):
         "ok": True,
         "enrichment": {
             "active": ctx.enrichment_active,
+            "reached": ctx.enrichment_reached,
+            "venting": ctx._enrichment_venting,
             "target": ctx.enrichment_target,
             "duration": ctx.enrichment_duration,
             "remaining": ctx.enrichment_remaining(),
+            "ramp_step": ctx.enrichment_ramp_step,
+            "ramp_current": ctx._enrichment_ramp_current,
         },
     }
 
@@ -1326,8 +1563,11 @@ async def api_stop():
     except Exception as e:
         logger.error("写入 start_pid=0 失败: %s", e)
         return {"ok": False, "error": str(e)}
-    ctx.stop_control()
-    return {"ok": True}
+    ctx.current_start_pid = 0
+    # 停止控制后自动转为仅检测模式：继续轮询读取气压，前端保持实时更新
+    ctx.start_control()
+    logger.info("停止控制完成，已自动切换至仅检测模式")
+    return {"ok": True, "monitor_only": True}
 
 
 @app.post("/api/save-data")
