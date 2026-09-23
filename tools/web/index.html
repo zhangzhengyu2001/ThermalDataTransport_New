@@ -68,6 +68,25 @@
     .comm-alert.error { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
     .comm-alert.warn { background: #fef3c7; color: #b45309; border: 1px solid #fde68a; }
 
+    .detect-alert {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 700;
+      background: #dc2626;
+      color: #fff;
+      margin-bottom: 14px;
+      box-shadow: 0 4px 16px rgba(220, 38, 38, 0.35);
+      animation: detectPulse 1s infinite;
+    }
+    @keyframes detectPulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.75; }
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
@@ -100,6 +119,8 @@
       margin-bottom: 8px;
     }
     .row label { min-width: 96px; color: var(--muted); font-size: 13px; }
+    .row.tight { gap: 8px; }
+    .row.tight label { min-width: auto; }
 
     input[type="number"], input[type="text"], select {
       padding: 7px 10px;
@@ -139,7 +160,7 @@
     .btn-danger:hover { background: var(--danger-hover); }
     .row .btn { margin-left: auto; }
     .row.start .btn { margin-left: 0; }
-    .btn-group { display: inline-flex; align-items: center; gap: 4px; }
+    .btn-group { display: inline-flex; align-items: center; gap: 8px; }
 
     .pill {
       display: inline-block;
@@ -335,6 +356,7 @@
     </header>
 
     <div class="comm-alert" id="comm-alert" style="display:none;"></div>
+    <div class="detect-alert" id="detect-alert" style="display:none;"></div>
 
     <div class="grid">
 
@@ -370,15 +392,15 @@
         </div>
         <div class="row">
           <label>补气步长 (Pa/级)</label>
-          <input id="enrich-ramp-step" type="number" step="100" min="0" value="2000" class="field" />
-          <span class="hint">0 = 直接设目标</span>
+          <input id="enrich-ramp-step" type="number" step="100" min="0" value="0" class="field" />
+          <span class="hint">0 = 默认策略（阶梯+精调）；&gt;0 = 手动步长</span>
         </div>
         <div class="row start">
           <button class="btn btn-primary" id="btn-enrich-start">开启富集</button>
           <button class="btn" id="btn-enrich-stop">取消</button>
         </div>
         <div class="row-hint">
-          <span class="hint">气压达到目标 (±500 Pa) 后开始计时；结束后自动大气流吹扫</span>
+          <span class="hint">气压达到目标 (±1000 Pa) 后开始计时；结束后自动大气流吹扫</span>
           <span class="badge badge-idle" id="enrich-status">未开启</span>
         </div>
       </section>
@@ -431,6 +453,27 @@
         </div>
       </section>
 
+      <section class="card" style="grid-column: 1 / -1;">
+        <div class="card-title"><span class="icon">🚨</span>污染物检测</div>
+        <div class="row">
+          <label>名称(可留空)</label>
+          <input id="det-name" type="text" placeholder="可留空，如 丙酮" class="field" />
+          <label>m/z 范围</label>
+          <input id="det-range" type="text" placeholder="58-59" class="field-sm" />
+          <label>阈值</label>
+          <input id="det-threshold" type="number" step="1000" min="0" value="50000" class="field" />
+          <label>冷却(s)</label>
+          <input id="det-cooldown" type="number" step="1" min="0" value="60" class="field-sm" />
+          <button class="btn btn-primary" id="btn-det-add">添加/更新</button>
+          <button class="btn" id="btn-det-reload">重载规则</button>
+        </div>
+        <div id="det-list"></div>
+        <div class="row-hint">
+          <span class="hint">最近命中: <span id="det-last">无</span></span>
+          <span class="hint" style="margin-left: auto;">规则文件 tools/detections.json（VSCode 可编辑，保存后自动重载）</span>
+        </div>
+      </section>
+
     </div>
 
     <div class="status-line status-global" id="status"></div>
@@ -439,6 +482,26 @@
 
       <section class="card">
         <div class="card-title"><span class="icon">📈</span>实时监控</div>
+        <div class="row start tight">
+          <label>模式</label>
+          <select id="auto-log-mode" style="flex: 0 0 auto; width: 56px;">
+            <option value="manual">手动</option>
+            <option value="timed">定时</option>
+          </select>
+          <label>时长</label>
+          <input id="auto-log-min" type="number" step="1" min="0" value="5" class="short" />
+          <span class="hint">分</span>
+          <input id="auto-log-sec" type="number" step="1" min="0" max="59" value="0" class="short" />
+          <span class="hint">秒</span>
+          <span class="btn-group">
+            <button class="btn btn-success" id="btn-pressure-log-start">开始</button>
+            <button class="btn btn-danger" id="btn-pressure-log-stop">停止</button>
+          </span>
+        </div>
+        <div class="row">
+          <span class="hint" id="auto-log-state"></span>
+          <span class="hint" id="auto-log-hint">文件: data/pressure_logs/日期/pressure_时间.csv</span>
+        </div>
         <div class="chart-wrap">
           <canvas id="pressure-chart"></canvas>
         </div>
@@ -545,6 +608,11 @@
     const elPeriod = document.getElementById("period");
     const elHistoryWindow = document.getElementById("history-window");
     const elStatus = document.getElementById("status");
+    const elAutoLogHint = document.getElementById("auto-log-hint");
+    const elAutoLogMode = document.getElementById("auto-log-mode");
+    const elAutoLogMin = document.getElementById("auto-log-min");
+    const elAutoLogSec = document.getElementById("auto-log-sec");
+    const elAutoLogState = document.getElementById("auto-log-state");
     const elConnBadge = document.getElementById("conn-badge");
 
     function setConnBadge(text, state) {
@@ -581,9 +649,15 @@
           const secs = Math.max(0, Math.ceil(e.remaining));
           const mm = Math.floor(secs / 60);
           const ss = secs % 60;
-          elEnrichStatus.textContent = `富集中: ${e.target} Pa，剩余 ${mm}分${ss}秒`;
+          let txt = `富集中: ${e.target} Pa，剩余 ${mm}分${ss}秒`;
+          if (typeof e.fill_time === "number" && e.fill_time > 0) {
+            txt += `（补气耗时 ${e.fill_time.toFixed(1)}s）`;
+          }
+          elEnrichStatus.textContent = txt;
         } else {
-          elEnrichStatus.textContent = `等待气压达到目标 (±500 Pa): 当前 ${Math.round(filtered || 0)} Pa`;
+          elEnrichStatus.textContent = e.quick
+            ? `默认策略补气中（阶梯→早关稳定）: 当前 ${Math.round(filtered || 0)} Pa`
+            : `等待气压达到目标 (±1000 Pa): 当前 ${Math.round(filtered || 0)} Pa`;
         }
         elEnrichStatus.className = "badge badge-active";
       } else {
@@ -615,6 +689,13 @@
     const elMsRefresh = document.getElementById("btn-ms-refresh");
     const elMsSelect = document.getElementById("btn-ms-select");
     const elMsCancel = document.getElementById("btn-ms-cancel");
+
+    // 记住 MS 服务器 IP：刷新后自动回填
+    const savedMsServer = localStorage.getItem("msServer");
+    if (savedMsServer) elMsServer.value = savedMsServer;
+    elMsServer.addEventListener("change", () => {
+      localStorage.setItem("msServer", elMsServer.value.trim());
+    });
 
     const maxPoints = 300;
 
@@ -707,6 +788,12 @@
 
     async function apiGet(path) {
       const resp = await fetch(backendBase + path);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    }
+
+    async function apiDelete(path) {
+      const resp = await fetch(backendBase + path, { method: "DELETE" });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       return resp.json();
     }
@@ -813,9 +900,22 @@
         elTargetDisplay.textContent = st.target.toFixed(1);
         elPeriod.value = st.period.toFixed(3);
         elHistoryWindow.value = st.history_window.toFixed(0);
+        elAutoLogHint.textContent = st.pressure_log_path
+          ? ("文件: " + st.pressure_log_path)
+          : "文件: data/pressure_logs/日期/pressure_时间.csv";
+        if (st.auto_log_mode) elAutoLogMode.value = st.auto_log_mode;
+        if (typeof st.auto_log_duration === "number") {
+          elAutoLogMin.value = Math.floor(st.auto_log_duration / 60);
+          elAutoLogSec.value = Math.round(st.auto_log_duration % 60);
+        }
+        elAutoLogState.textContent = st.pressure_log_active ? "（记录中）" : "";
         if (st.stm32.port) elStm32Port.value = st.stm32.port;
         elStm32Baud.value = st.stm32.baud;
         elStm32Addr.value = st.stm32.addr;
+        if (st.ms && st.ms.server) {
+          elMsServer.value = st.ms.server;
+          localStorage.setItem("msServer", st.ms.server);
+        }
         if (st.enrichment) {
           updateEnrichmentStatus(st.enrichment, st.filtered);
           if (st.enrichment.active) {
@@ -880,6 +980,57 @@
       }
     };
 
+    function autoLogDurationSec() {
+      const m = parseFloat(elAutoLogMin.value);
+      const s = parseFloat(elAutoLogSec.value);
+      if (isNaN(m) || m < 0) return 300;
+      if (isNaN(s) || s < 0 || s >= 60) return 300;
+      return m * 60 + s;
+    }
+
+    async function applyAutoLogSettings() {
+      try {
+        await apiPost("/api/pressure-log", {
+          enabled: true,
+          mode: elAutoLogMode.value,
+          duration: autoLogDurationSec(),
+        });
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "更新自动记录设置失败: " + (e.message || e);
+      }
+    }
+
+    elAutoLogMode.addEventListener("change", applyAutoLogSettings);
+    elAutoLogMin.addEventListener("change", applyAutoLogSettings);
+    elAutoLogSec.addEventListener("change", applyAutoLogSettings);
+
+    document.getElementById("btn-pressure-log-start").onclick = async () => {
+      try {
+        await applyAutoLogSettings();
+        const r = await apiPost("/api/pressure-log/start", {});
+        elAutoLogState.textContent = "（记录中）";
+        elAutoLogHint.textContent = r.path
+          ? ("文件: " + r.path)
+          : "文件: data/pressure_logs/日期/pressure_时间.csv";
+        elStatus.textContent = "气压记录已开始";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "开始记录失败: " + (e.message || e);
+      }
+    };
+
+    document.getElementById("btn-pressure-log-stop").onclick = async () => {
+      try {
+        await apiPost("/api/pressure-log/stop", {});
+        elAutoLogState.textContent = "";
+        elStatus.textContent = "气压记录已停止";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "停止记录失败: " + (e.message || e);
+      }
+    };
+
     document.getElementById("btn-open-stm32").onclick = async () => {
       const port = elStm32Port.value.trim();
       const baudrate = parseInt(elStm32Baud.value, 10) || 115200;
@@ -941,7 +1092,7 @@
         if (r.enrichment.reached) {
           elStatus.textContent = "富集检测已开启（已自动开始控制），正在计时";
         } else {
-          elEnrichStatus.textContent = "等待气压达到目标 (±500 Pa) 后开始计时";
+          elEnrichStatus.textContent = "等待气压达到目标 (±1000 Pa) 后开始计时";
           elStatus.textContent = "富集检测已开启（已自动开始控制），等待气压到达目标后开始计时";
         }
       } catch (e) {
@@ -1049,7 +1200,7 @@
         }
       } catch (e) {
         console.error(e);
-        elStatus.textContent = "打开远程文件失败";
+        elStatus.textContent = "打开远程文件失败: " + (e.message || e);
       }
     };
 
@@ -1077,7 +1228,7 @@
         elStatus.textContent = "";
       } catch (e) {
         console.error(e);
-        elStatus.textContent = "加载远程目录失败";
+        elStatus.textContent = "加载远程目录失败: " + (e.message || e);
       }
     };
 
@@ -1086,7 +1237,7 @@
         await msLoadList(elMsRoot.value);
       } catch (e) {
         console.error(e);
-        elStatus.textContent = "切换根目录失败";
+        elStatus.textContent = "切换根目录失败: " + (e.message || e);
       }
     };
 
@@ -1096,7 +1247,7 @@
         await msLoadList(msParentPath);
       } catch (e) {
         console.error(e);
-        elStatus.textContent = "返回上一级失败";
+        elStatus.textContent = "返回上一级失败: " + (e.message || e);
       }
     };
 
@@ -1106,7 +1257,7 @@
         await msLoadList(msCurrentPath);
       } catch (e) {
         console.error(e);
-        elStatus.textContent = "刷新目录失败";
+        elStatus.textContent = "刷新目录失败: " + (e.message || e);
       }
     };
 
@@ -1143,7 +1294,7 @@
         elStatus.textContent = `已写入日志，质谱最新时间: ${r.ms_end_time}`;
       } catch (e) {
         console.error(e);
-        elStatus.textContent = "调用 MS 服务或写入日志失败";
+        elStatus.textContent = "调用 MS 服务或写入日志失败: " + (e.message || e);
       }
     };
 
@@ -1156,16 +1307,20 @@
 
     function connectWs() {
       const ws = new WebSocket(wsUrl);
-      ws.onopen = () => {
+      ws.onopen = async () => {
         console.log("WS 连接成功");
         wsOpen = true;
-        setConnBadge("实时推送已连接", "online");
         // 连接/重连后重新同步后端状态，避免重启后页面数值不更新
-        initFromBackend();
+        await initFromBackend();
+        setConnBadge("实时推送已连接", "online");
       };
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
+          if (msg.type === "detection") {
+            showDetectionAlert(msg);
+            return;
+          }
           const t = new Date(msg.timestamp * 1000);
           const filtered = msg.filtered_pressure;
           const target = msg.target_pressure;
@@ -1261,6 +1416,7 @@
       eicChart.data.datasets.push(dataset);
       eicCurves.push({ key, massRange, label: dataset.label, dataset });
       renderEicChips();
+      fetchEicHistoryIfNeeded(eicCurves[eicCurves.length - 1]);
       return true;
     }
 
@@ -1302,6 +1458,28 @@
         dataset.data = dataset.data.slice(-30000);
       }
       return true;
+    }
+
+    async function fetchEicHistoryIfNeeded(curve) {
+      // 增量模式下新添加的曲线没有历史数据：
+      // 若已拉取过数据（msLastEnd>0），立即补拉该曲线 0 ~ msLastEnd 的完整历史
+      if (!(msLastEnd > 0)) return;
+      try {
+        const r = await apiPost("/api/ms-chro-lite", {
+          mass_range: curve.massRange,
+          start_time: 0,
+          end_time: msLastEnd,
+        });
+        if (r.ok) {
+          if (appendCurvePoints(curve.dataset, r.time, r.intensity) && eicChart) {
+            eicChart.update("none");
+          }
+        } else {
+          elStatus.textContent = `EIC ${curve.massRange} 历史数据请求失败: ${r.error || "未知错误"}`;
+        }
+      } catch (e) {
+        console.warn(`EIC ${curve.massRange} 历史数据拉取失败`, e);
+      }
     }
 
     function resetMsSpectrumData() {
@@ -1361,6 +1539,9 @@
             });
             if (r.ok && appendCurvePoints(c.dataset, r.time, r.intensity)) {
               savePayload.eics.push({ mass_range: c.massRange, intensity: r.intensity });
+              hasNewData = true;
+            } else if (!r.ok) {
+              elStatus.textContent = `EIC ${c.massRange} 请求失败: ${r.error || "未知错误"}`;
             }
           } catch (e) {
             console.warn(`EIC ${c.massRange} 拉取失败`, e);
@@ -1468,6 +1649,121 @@
     elLogLevel.onchange = refreshLogs;
     setInterval(refreshLogs, 5000);
     refreshLogs();
+
+    // ---- 污染物检测 ----
+    const elDetName = document.getElementById("det-name");
+    const elDetRange = document.getElementById("det-range");
+    const elDetThreshold = document.getElementById("det-threshold");
+    const elDetCooldown = document.getElementById("det-cooldown");
+    const elDetList = document.getElementById("det-list");
+    const elDetLast = document.getElementById("det-last");
+    const elDetectAlert = document.getElementById("detect-alert");
+
+    async function loadDetections() {
+      try {
+        const r = await apiGet("/api/detections");
+        if (!r.ok) return;
+        elDetList.innerHTML = "";
+        (r.rules || []).forEach((rule) => {
+          const row = document.createElement("div");
+          row.className = "row";
+          row.style.marginBottom = "4px";
+          const display = rule.display_name || rule.name || `m/z ${rule.mass_range}`;
+          const key = rule.key || rule.name || rule.mass_range;
+          row.innerHTML =
+            `<span class="eic-chip" style="margin:0;">` +
+            `<span class="dot" style="background:${rule.enabled ? "#10b981" : "#94a3b8"}"></span>${escapeHtml(display)}</span>` +
+            `<span class="hint">m/z ${escapeHtml(rule.mass_range)}</span>` +
+            `<span class="hint">阈值 ${Math.round(rule.threshold)}</span>` +
+            `<span class="hint">冷却 ${rule.cooldown_s}s</span>` +
+            `<span class="hint">${rule.enabled ? "启用" : "停用"}</span>` +
+            `<button class="btn btn-danger" data-del="${escapeHtml(key)}">删除</button>`;
+          const delBtn = row.querySelector("[data-del]");
+          delBtn.onclick = async () => {
+            try {
+              await apiDelete(`/api/detections/${encodeURIComponent(key)}`);
+              await loadDetections();
+            } catch (e) {
+              console.error(e);
+              elStatus.textContent = "删除检测规则失败: " + (e.message || e);
+            }
+          };
+          elDetList.appendChild(row);
+        });
+      } catch (e) {
+        console.warn("获取检测规则失败", e);
+      }
+    }
+
+    document.getElementById("btn-det-add").onclick = async () => {
+      const name = elDetName.value.trim();
+      const range = elDetRange.value.trim();
+      const threshold = parseFloat(elDetThreshold.value);
+      const cooldown = parseFloat(elDetCooldown.value);
+      if (!/^\d+(\.\d+)?\s*-\s*\d+(\.\d+)?$/.test(range)) return alert("m/z 范围格式应为 例如 58-59");
+      if (isNaN(threshold) || threshold < 0) return alert("阈值必须 >= 0");
+      try {
+        await apiPost("/api/detections", {
+          name,
+          mass_range: range,
+          threshold,
+          enabled: true,
+          cooldown_s: isNaN(cooldown) ? 60 : cooldown,
+        });
+        elDetName.value = "";
+        elDetRange.value = "";
+        await loadDetections();
+        elStatus.textContent = "检测规则已保存";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "保存检测规则失败: " + (e.message || e);
+      }
+    };
+
+    document.getElementById("btn-det-reload").onclick = async () => {
+      try {
+        await apiPost("/api/detections/reload", {});
+        await loadDetections();
+        elStatus.textContent = "检测规则已重载";
+      } catch (e) {
+        console.error(e);
+        elStatus.textContent = "重载检测规则失败: " + (e.message || e);
+      }
+    };
+
+    function playBeep() {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        const ac = new Ctx();
+        const o = ac.createOscillator();
+        const g = ac.createGain();
+        o.connect(g);
+        g.connect(ac.destination);
+        o.frequency.value = 880;
+        o.type = "sine";
+        g.gain.setValueAtTime(0.3, ac.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.6);
+        o.start();
+        o.stop(ac.currentTime + 0.6);
+      } catch (e) {
+        console.warn("声音提醒失败", e);
+      }
+    }
+
+    function showDetectionAlert(ev) {
+      elDetectAlert.textContent =
+        `🚨 检测到: ${ev.name}（m/z ${ev.mass_range}，强度 ${Math.round(ev.intensity)} > 阈值 ${Math.round(ev.threshold)}）`;
+      elDetectAlert.style.display = "";
+      elDetLast.textContent =
+        `${ev.name} @ ${new Date(ev.time * 1000).toLocaleTimeString()}（强度 ${Math.round(ev.intensity)}）`;
+      playBeep();
+      clearTimeout(window._detectAlertTimer);
+      window._detectAlertTimer = setTimeout(() => {
+        elDetectAlert.style.display = "none";
+      }, 8000);
+    }
+
+    loadDetections();
 
     // 状态兜底轮询：WebSocket 未连接时也保证数值/图表更新
     // （解决后端重启后点击“仅检测/开始控制”但页面不更新、需手动刷新才更新的问题）

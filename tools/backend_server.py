@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import queue
 import threading
 import time
 from typing import Optional, List, Dict, Any
@@ -28,6 +29,7 @@ from pydantic import BaseModel
 
 from tools.modbus_host import ModbusPressureClient
 from tools.logger_config import get_logger, init_logging
+from tools.detector import Detector
 
 # ---- 日志系统初始化 ----
 init_logging()
@@ -67,14 +69,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         "period": 0.1,
         "history_window": 60.0,
+        # 自动记录气压变化数据到 CSV（按天分文件）
+        "auto_log": True,
+        "auto_log_interval": 0.1,  # 秒；0 = 每个采样点都记录
+        "auto_log_mode": "manual",  # manual=手动停止, timed=定时停止
+        "auto_log_duration": 300.0,  # 定时模式时长（秒）
         # 仅检测模式下是否主动写 0x0020 触发滤波气压刷新（部分固件需要）
         "trigger_refresh": False,
-        # 富集两段式渐变：大段步长（Pa/级）
-        "enrichment_ramp_step": 2000.0,
-        # 距目标多少 Pa 时切换为精调小步长
-        "enrichment_fine_switch": 1000.0,
-        # 精调阶段步长（Pa/级）
-        "enrichment_fine_step": 200.0,
+        # 富集三段式渐变补气：
+        "enrichment_ramp_step": 10000.0,  # 大步段步长（Pa/级）
+        "enrichment_coarse_confirm": 300.0,  # 大步段确认口径：到达阶梯下方该值（Pa）即进下一级
+        "enrichment_decel_step": 2000.0,  # 定速段步长（Pa/级）：剩余距离 ≤ 大步长时改用该步长
+        "enrichment_fine_switch": 1500.0,  # 剩余距离 ≤ 该值时切换精调（Pa）
+        "enrichment_fine_step": 300.0,  # 精调阶段步长（Pa/级）
+        "enrichment_fine_confirm": 500.0,  # 精调阶段确认口径：实际气压进入当前阶梯 ±该值（Pa）
         # 富集结束后快速补气：先写“100000+过压余量”让阀门全开，到 100000-收阀余量 再收阀
         "enrichment_fast_vent": True,
         "enrichment_vent_overshoot": 100000.0,
@@ -102,7 +110,38 @@ def load_config() -> Dict[str, Any]:
 CONFIG = load_config()
 
 # 富集模式：判定“气压已达到目标”的允许误差（Pa）
-ENRICHMENT_PRESSURE_TOLERANCE = 500.0
+ENRICHMENT_PRESSURE_TOLERANCE = 1000.0
+
+# 默认补气策略（写死）：固定目标气压的参考点阶梯。
+# stages = 硬编码参考气压点（从 ~50K 起点加压时经过的固定台阶，实际起点更高时自动跳过）。
+# 统一策略：最后一个参考点（目标-5K）处“早关阀门”——等流量收掉、滑行到位后，
+# 目标仅显示为目标值，真实控制保持早关点、阀门不再动（避免追着上升气流导致超调）。
+DEFAULT_ENRICHMENT_PROFILES: Dict[int, Dict[str, Any]] = {
+    60000: {"stages": [59000.0], "confirm": 300.0,
+            "fine1_step": 1000.0, "fine2_switch": 3000.0, "fine2_step": 500.0, "fine_confirm": 500.0,
+            "settle": True, "settle_confirm": 300.0, "settle_overshoot": 4000.0,
+            "settle_rate": 150.0, "settle_timeout": 10.0, "settle_flow": 0.03, "hold_on_settle": True},
+    70000: {"stages": [60000.0, 68000.0], "confirm": 300.0,
+            "fine1_step": 1000.0, "fine2_switch": 3000.0, "fine2_step": 500.0, "fine_confirm": 500.0,
+            "settle": True, "settle_confirm": 300.0, "settle_overshoot": 4000.0,
+            "settle_rate": 150.0, "settle_timeout": 10.0, "settle_flow": 0.03, "hold_on_settle": True},
+    80000: {"stages": [70000.0, 77000.0], "confirm": 300.0,
+            "fine1_step": 1000.0, "fine2_switch": 3000.0, "fine2_step": 500.0, "fine_confirm": 500.0,
+            "settle": True, "settle_confirm": 300.0, "settle_overshoot": 4000.0,
+            "settle_rate": 150.0, "settle_timeout": 10.0, "settle_flow": 0.03, "hold_on_settle": True},
+    90000: {"stages": [80000.0, 85500.0], "confirm": 300.0,
+            "fine1_step": 1000.0, "fine2_switch": 3000.0, "fine2_step": 500.0, "fine_confirm": 500.0,
+            "settle": True, "settle_confirm": 300.0, "settle_overshoot": 4000.0,
+            "settle_rate": 150.0, "settle_timeout": 10.0, "settle_flow": 0.03, "hold_on_settle": True},
+    # 100K：阶梯加密到 95K（目标-5K）后关阀；实测 98K 关阀会滑行到 ~104K，95K 关阀滑行落在 ~99~100K
+    100000: {"stages": [80000.0, 88000.0, 92000.0, 95500.0], "confirm": 300.0,
+             "fine1_step": 1000.0, "fine2_switch": 3000.0, "fine2_step": 500.0, "fine_confirm": 500.0,
+             "settle": True, "settle_confirm": 300.0, "settle_overshoot": 4000.0,
+             "settle_rate": 150.0, "settle_timeout": 10.0, "settle_flow": 0.03, "hold_on_settle": True},
+}
+
+# 污染物检测规则文件（VSCode 可直接编辑，保存后自动重载）
+DETECTIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detections.json")
 
 
 def reload_pid_from_config() -> None:
@@ -146,6 +185,23 @@ def _ms_http_post_json(base_url: str, path: str, payload: Dict[str, Any], timeou
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         text = resp.read().decode("utf-8")
     return json.loads(text)
+
+
+def _ms_proxy_error(e: Exception) -> Dict[str, Any]:
+    """把 MS 主机代理调用异常转换为可读错误信息，并记录日志。"""
+    reason = getattr(e, "reason", None) or e
+    text = str(reason)
+    low = text.lower()
+    if isinstance(reason, TimeoutError) or "timed out" in low or "timedout" in low:
+        msg = "连接 MS 主机超时：请确认 MS 电脑上的 MSHTTPFastAPI 服务已启动，且 IP/端口正确"
+    elif isinstance(reason, ConnectionRefusedError) or "connection refused" in low:
+        msg = "MS 主机拒绝连接（8899 端口未监听）：请确认 MSHTTPFastAPI 服务正在运行"
+    elif isinstance(e, urllib.error.HTTPError):
+        msg = f"MS 主机返回 HTTP {e.code}: {e.reason}"
+    else:
+        msg = f"无法连接 MS 主机: {text}"
+    logger.error("MS 代理调用失败: %s", msg)
+    return {"ok": False, "error": msg}
 
 
 def _ms_refresh_and_get_end_time(server: str, raw_path: str) -> str:
@@ -318,9 +374,21 @@ class ControlContext:
         # 实际控制周期在 STM32 固定为 100 ms。
         self.period: float = float(pressure_cfg.get("period", 0.1))
         self.trigger_refresh: bool = bool(pressure_cfg.get("trigger_refresh", False))
-        self._enrichment_ramp_step_default: float = float(pressure_cfg.get("enrichment_ramp_step", 2000.0))
-        self._enrichment_fine_switch: float = float(pressure_cfg.get("enrichment_fine_switch", 1000.0))
-        self._enrichment_fine_step: float = float(pressure_cfg.get("enrichment_fine_step", 200.0))
+        self.auto_log: bool = bool(pressure_cfg.get("auto_log", True))
+        self.auto_log_interval: float = float(pressure_cfg.get("auto_log_interval", 0.1))
+        self.auto_log_mode: str = str(pressure_cfg.get("auto_log_mode", "manual"))
+        self.auto_log_duration: float = float(pressure_cfg.get("auto_log_duration", 300.0))
+        self._pressure_log_lock = threading.Lock()
+        self._pressure_log_last_ts: float = 0.0
+        self._pressure_log_path: Optional[str] = None
+        self._pressure_log_session: bool = False  # 当前是否处于记录会话中
+        self._pressure_log_session_start: float = 0.0
+        self._enrichment_ramp_step_default: float = float(pressure_cfg.get("enrichment_ramp_step", 10000.0))
+        self._enrichment_decel_step: float = float(pressure_cfg.get("enrichment_decel_step", 2000.0))
+        self._enrichment_fine_switch: float = float(pressure_cfg.get("enrichment_fine_switch", 1500.0))
+        self._enrichment_fine_step: float = float(pressure_cfg.get("enrichment_fine_step", 300.0))
+        self._enrichment_coarse_confirm: float = float(pressure_cfg.get("enrichment_coarse_confirm", 300.0))
+        self._enrichment_fine_confirm: float = float(pressure_cfg.get("enrichment_fine_confirm", 500.0))
         self._enrichment_fast_vent: bool = bool(pressure_cfg.get("enrichment_fast_vent", True))
         self._enrichment_vent_overshoot: float = float(pressure_cfg.get("enrichment_vent_overshoot", 100000.0))
         self._enrichment_vent_close_margin: float = float(pressure_cfg.get("enrichment_vent_close_margin", 500.0))
@@ -330,6 +398,14 @@ class ControlContext:
         self.current_filtered: float = 0.0
         self.current_air: int = 0
         self.current_target: float = 0.0
+        # 富集到达后仅用于“显示”的目标气压（不写入 STM32，真实控制仍走渐变）
+        self._enrichment_display_target: Optional[float] = None
+        # 默认补气策略：当前目标对应的写死阶梯策略（None = 手动步长三段式渐变）
+        self._enrichment_quick_profile: Optional[Dict[str, Any]] = None
+        # 最后参考点的稳定确认状态（仅启用了 settle 的策略使用）
+        self._enrichment_settle_stage: Optional[float] = None
+        self._enrichment_settle_start: float = 0.0
+        self._enrichment_settle_prev: Optional[float] = None
         self.current_flow_cmd: float = 0.0
         self.current_start_pid: int = 0  # 0=仅检测, 1=控制模式
 
@@ -371,9 +447,26 @@ class ControlContext:
         self._enrichment_ramp_current: float = 0.0  # 渐变过程中当前已写入的目标气压
         self._enrichment_venting: bool = False  # 是否处于结束后的快速补气阶段
         self._enrichment_vent_start_ts: float = 0.0
+        self._enrichment_begin_ts: float = 0.0  # 富集开始（点击开启）时刻
+        self._enrichment_fill_time: float = 0.0  # 补气耗时：开始富集到到达目标（秒）
         self._enrichment_stop = threading.Event()
         self._enrichment_thread = threading.Thread(target=self._enrichment_loop, daemon=True)
         self._enrichment_thread.start()
+
+        # 污染物检测：独立后台线程，只访问 MS 主机 HTTP，不影响串口/富集等功能
+        self.detector = Detector()
+        self._detection_events: "queue.Queue" = queue.Queue()
+        self._detection_csv_lock = threading.Lock()
+        self._detection_rules_mtime: float = 0.0
+        try:
+            n = self.detector.load_from_file(DETECTIONS_PATH)
+            self._detection_rules_mtime = os.path.getmtime(DETECTIONS_PATH)
+            logger.info("检测规则加载完成: %d 条", n)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("检测规则加载失败: %s", e)
+        self._detection_stop = threading.Event()
+        self._detection_thread = threading.Thread(target=self._detection_loop, daemon=True)
+        self._detection_thread.start()
 
         # WebSocket 客户端列表
         self._ws_clients: List[WebSocket] = []
@@ -424,10 +517,14 @@ class ControlContext:
         )
 
     # ---- 富集检测模式 ----
-    def start_enrichment(self, target: float, duration: float, ramp_step: Optional[float] = None):
-        """一键开启富集检测模式：写入富集目标气压，气压到达目标后才开始计时。
+    def start_enrichment(self, target: float, duration: float, ramp_step: Optional[float] = None,
+                         quick_profile: Optional[Dict[str, Any]] = None):
+        """开启富集检测模式：写入富集目标气压，气压到达目标后才开始计时。
 
-        ramp_step: 渐变补气大段步长 (Pa/级)。None 使用配置默认值；0 表示直接设置目标（不渐变）。
+        ramp_step: 渐变补气大段步长 (Pa/级)。
+            None 或 ≤0 = 使用写死的默认策略（参考点阶梯 + 1000→500 精调）；
+            >0 = 手动步长，走大步→定速→精调三段式。
+        quick_profile: 内部使用的写死补气策略，一般无需传入。
         """
         if self._modbus_cli is None:
             raise RuntimeError("STM32 串口未打开")
@@ -436,9 +533,8 @@ class ControlContext:
         if duration <= 0:
             raise ValueError("富集时长必须 > 0")
 
-        if ramp_step is None:
-            ramp_step = self._enrichment_ramp_step_default
-        self.enrichment_ramp_step = max(0.0, float(ramp_step))
+        ramp_step = 0.0 if ramp_step is None else max(0.0, float(ramp_step))
+        self.enrichment_ramp_step = ramp_step
 
         # 富集模式即代表开始控制：切换 STM32 至控制模式并确保轮询线程运行
         try:
@@ -456,39 +552,185 @@ class ControlContext:
             logger.warning("富集开启时读取当前气压失败，直接使用目标值: %s", e)
             current_pressure = target
 
+        # 未手动指定步长时，自动采用写死的默认策略（固定目标用对应阶梯，其他目标按同一规律生成）
+        if quick_profile is None and ramp_step <= 0:
+            quick_profile = DEFAULT_ENRICHMENT_PROFILES.get(int(round(target)))
+            if quick_profile is None:
+                quick_profile = self._generic_default_profile(target, current_pressure)
+
         self.enrichment_target = target
         self.enrichment_duration = duration
         self.enrichment_active = True
         self.enrichment_reached = False
         self.enrichment_start_ts = 0.0
+        self._enrichment_begin_ts = time.time()
+        self._enrichment_fill_time = 0.0
         self._enrichment_venting = False
         self._enrichment_vent_start_ts = 0.0
+        self._enrichment_quick_profile = quick_profile
+        self._enrichment_display_target = None
+        self._enrichment_settle_stage = None
+        self._enrichment_settle_start = 0.0
+        self._enrichment_settle_prev = None
 
-        if self.enrichment_ramp_step > 0 and current_pressure < target - ENRICHMENT_PRESSURE_TOLERANCE:
-            # 两段式渐变补气：先写入当前气压，随后按大段/精调步长抬升目标
+        if (quick_profile is not None or self.enrichment_ramp_step > 0) \
+                and current_pressure < target - ENRICHMENT_PRESSURE_TOLERANCE:
+            # 渐变补气：先写入当前气压，再按默认阶梯或手动步长爬升
             self._enrichment_ramp_current = current_pressure
             self._modbus_cli.write_target_pressure(current_pressure)
             self.current_target = current_pressure
-            logger.info("富集检测模式已开启: 目标=%.1f Pa, 时长=%.1f s, 两段式渐变(大段%.0f Pa/级, "
-                        "精调%.0f Pa/级, 切换余量%.0f Pa) (当前 %.1f Pa)",
-                        target, duration, self.enrichment_ramp_step,
-                        self._enrichment_fine_step, self._enrichment_fine_switch, current_pressure)
+            if quick_profile is not None:
+                logger.info("富集检测模式已开启(默认阶梯策略): 目标=%.0f Pa, 时长=%.1f s, 参考点=%s, 精调 %d→%d Pa/级 (当前 %.1f Pa)",
+                            target, duration, [int(s) for s in quick_profile["stages"]],
+                            int(quick_profile["fine1_step"]), int(quick_profile["fine2_step"]), current_pressure)
+            else:
+                logger.info("富集检测模式已开启: 目标=%.1f Pa, 时长=%.1f s, 三段式渐变(大步%.0f Pa/级, "
+                            "减速+精调%.0f Pa/级, 精调切换余量%.0f Pa) (当前 %.1f Pa)",
+                            target, duration, self.enrichment_ramp_step,
+                            self._enrichment_fine_step, self._enrichment_fine_switch, current_pressure)
         else:
-            # 直接写入目标（已接近目标或未启用渐变）
+            # 直接写入目标（已接近目标）
             self._enrichment_ramp_current = target
             self._modbus_cli.write_target_pressure(target)
             self.current_target = target
-            logger.info("富集检测模式已开启: 目标气压=%.1f Pa, 时长=%.1f s, "
-                        "等待气压到达目标(±%.0f Pa)后开始计时",
-                        target, duration, ENRICHMENT_PRESSURE_TOLERANCE)
+            if quick_profile is not None:
+                logger.info("富集检测模式已开启(默认阶梯策略，当前已接近目标): 目标=%.0f Pa, 时长=%.1f s", target, duration)
+            else:
+                logger.info("富集检测模式已开启: 目标气压=%.1f Pa, 时长=%.1f s, "
+                            "等待气压到达目标(±%.0f Pa)后开始计时",
+                            target, duration, ENRICHMENT_PRESSURE_TOLERANCE)
 
-    def _advance_ramp(self, next_target: float) -> None:
-        """把渐变目标写入 STM32（仅在确实抬升时调用）。"""
+    def _generic_default_profile(self, target: float, current: float) -> Dict[str, Any]:
+        """非固定目标时按同一规律生成默认策略：目标-20K/10K/5K 参考点 + 1000→500 精调。"""
+        stages = []
+        for offset in (20000.0, 10000.0, 5000.0):
+            s = target - offset
+            if s > current + 300.0 and s < target - 1500.0:
+                stages.append(s)
+        return {
+            "stages": stages,
+            "confirm": 300.0,
+            "fine1_step": 1000.0,
+            "fine2_switch": 3000.0,
+            "fine2_step": 500.0,
+            "fine_confirm": 500.0,
+        }
+
+    def _advance_ramp(self, next_target: float, update_display: bool = True) -> None:
+        """把渐变目标写入 STM32（仅在确实抬升时调用）。
+
+        update_display=False 时只做真实控制写入，不改动前端显示的目标气压
+        （富集到达后显示目标值，而真实控制仍按渐变小步爬升，避免跳变超调）。
+        """
         if next_target > self._enrichment_ramp_current:
             self._enrichment_ramp_current = next_target
             self._modbus_cli.write_target_pressure(next_target)
-            self.current_target = next_target
+            if update_display:
+                self.current_target = next_target
             logger.info("富集: 渐变目标 -> %.1f Pa", next_target)
+
+    def _ramp_next_target(self, filtered: float, flow: Optional[float] = None) -> Optional[float]:
+        """根据当前实际气压计算下一步应写入的渐变目标；无需推进时返回 None。
+
+        默认策略（写死）：沿固定参考气压点阶梯前进，进入精调后按 1000→500 Pa/级收尾；
+        手动步长：大步→定速→精调三段式。
+        """
+        profile = self._enrichment_quick_profile
+        if profile is not None:
+            # 阶梯段：依次写固定的参考气压点（已低于/等于当前点的自动跳过）。
+            # 确认口径与大步段一致：实际气压到达“当前已写入目标”下方 confirm 以内（或已冲过），
+            # 说明这一级走完，立即写下一个参考点（否则 PID 会停在当前目标上等不到下一级）。
+            for stage in profile["stages"]:
+                if stage > self._enrichment_ramp_current:
+                    if filtered >= self._enrichment_ramp_current - profile["confirm"]:
+                        return stage
+                    return None
+            # 最后一个参考点：若配置了稳定确认，等气压稳住再进精调（防惯性超调）
+            if profile.get("settle", False) and self._enrichment_ramp_current == profile["stages"][-1]:
+                # 进入早关点立即把显示目标切到富集目标（真实控制保持早关点，阀门不动）
+                if profile.get("hold_on_settle", False) and self._enrichment_display_target != self.enrichment_target:
+                    self._display_enrichment_target()
+                    logger.info("富集: 显示目标 -> %.0f Pa（真实控制保持 %.0f Pa，阀门不动）",
+                                self.enrichment_target, self._enrichment_ramp_current)
+                if not self._settle_check(profile, filtered, flow):
+                    return None
+                if profile.get("hold_on_settle", False):
+                    # 稳定后不再精调推进：显示目标对齐富集目标，真实控制保持最后参考点（阀门关闭）
+                    self._finish_ramp_hold(filtered)
+                    return None
+            # 精调段：剩余 > fine2_switch 用 fine1_step，否则 fine2_step
+            remaining = self.enrichment_target - self._enrichment_ramp_current
+            if remaining <= 0:
+                return None
+            step = profile["fine1_step"] if remaining > profile["fine2_switch"] else profile["fine2_step"]
+            if filtered >= self._enrichment_ramp_current - profile["fine_confirm"]:
+                return min(self.enrichment_target, self._enrichment_ramp_current + step)
+            return None
+
+        if self.enrichment_ramp_step <= 0 or filtered >= self.enrichment_target:
+            return None
+        remaining = self.enrichment_target - self._enrichment_ramp_current
+        if remaining > self._enrichment_fine_switch:
+            # 大步/定速段：单向确认——气压到达当前阶梯下方 coarse_confirm 以内即进入下一级
+            if filtered >= self._enrichment_ramp_current - self._enrichment_coarse_confirm:
+                step = self.enrichment_ramp_step
+                if remaining <= self.enrichment_ramp_step:
+                    step = self._enrichment_decel_step
+                return min(self.enrichment_target,
+                           self._enrichment_ramp_current + step,
+                           # 最多推进到“目标 - 精调切换余量”，避免跨过精调区
+                           self.enrichment_target - self._enrichment_fine_switch)
+            return None
+        # 精调段：单向确认，小步爬升
+        if filtered >= self._enrichment_ramp_current - self._enrichment_fine_confirm:
+            return min(self.enrichment_target, self._enrichment_ramp_current + self._enrichment_fine_step)
+        return None
+
+    def _settle_check(self, profile: Dict[str, Any], filtered: float,
+                      flow: Optional[float] = None) -> bool:
+        """最后一个参考点的稳定确认：气压到位且流量收掉（阀门基本关闭）/上升放缓才允许继续。
+
+        已明显冲过参考点或等待超时则强制放行，避免封死腔体时卡住。
+        """
+        now = time.time()
+        if self._enrichment_settle_stage != self._enrichment_ramp_current:
+            self._enrichment_settle_stage = self._enrichment_ramp_current
+            self._enrichment_settle_start = now
+            self._enrichment_settle_prev = None
+        # 已明显冲过参考点：不再等待（封死腔体降不下来，按“已过点”继续）
+        if filtered >= self._enrichment_ramp_current + profile.get("settle_overshoot", 2000.0):
+            return True
+        # 气压还没到位
+        if filtered < self._enrichment_ramp_current - profile.get("settle_confirm", 300.0):
+            return False
+        # 到位后：流量已收（阀门基本关闭）视为稳定，直接放行
+        if flow is not None and flow <= profile.get("settle_flow", 0.03):
+            return True
+        # 没有流量信息时退而看上升速率：连续两次读数基本不动视为稳定
+        prev = self._enrichment_settle_prev
+        self._enrichment_settle_prev = filtered
+        if prev is not None and abs(filtered - prev) <= profile.get("settle_rate", 150.0):
+            return True
+        # 超时保护：等太久直接继续，避免无限等待
+        return now - self._enrichment_settle_start >= profile.get("settle_timeout", 10.0)
+
+    def _finish_ramp_hold(self, filtered: float) -> None:
+        """稳定确认通过后收尾：视为已到达并开始计时（显示目标已在进入早关点时切换）。"""
+        if not self.enrichment_reached:
+            self.enrichment_reached = True
+            self.enrichment_start_ts = time.time()
+            self._enrichment_fill_time = self.enrichment_start_ts - self._enrichment_begin_ts
+            logger.info("富集: 稳定确认通过（实际 %.1f Pa，阀门关闭），视为已到达目标区间，"
+                        "开始计时 %.0f s（补气耗时 %.1f 秒）",
+                        filtered, self.enrichment_duration, self._enrichment_fill_time)
+        self._enrichment_ramp_current = self.enrichment_target
+        self._enrichment_display_target = self.enrichment_target
+        self.current_target = self.enrichment_target
+
+    def _display_enrichment_target(self) -> None:
+        """仅切换显示：前端目标气压显示富集目标，不写入 STM32（真实控制保持早关点，阀门不动）。"""
+        self._enrichment_display_target = self.enrichment_target
+        self.current_target = self.enrichment_target
 
     def stop_enrichment(self):
         """手动取消富集检测模式（不改变当前目标气压）。"""
@@ -496,6 +738,8 @@ class ControlContext:
             logger.info("富集检测模式已手动取消")
         self.enrichment_active = False
         self._enrichment_venting = False
+        self._enrichment_quick_profile = None
+        self._enrichment_display_target = None
 
     def enrichment_remaining(self) -> float:
         """返回富集剩余秒数（未开启时为 0）。"""
@@ -513,40 +757,28 @@ class ControlContext:
                 time.sleep(0.5)
                 continue
 
-            # 阶段 1：等待气压到达目标（±500 Pa），到达后才开始计时
+            # 阶段 1：等待气压到达目标（单侧锁定：来到目标下方容差窗口即算到达），到达后才开始计时
             if not self.enrichment_reached:
                 try:
                     filtered, _air, _target, _flow, _pid = self._modbus_cli.read_all_states()
-                    if abs(filtered - self.enrichment_target) <= ENRICHMENT_PRESSURE_TOLERANCE:
+                    if filtered >= self.enrichment_target - ENRICHMENT_PRESSURE_TOLERANCE:
                         self.enrichment_reached = True
                         self.enrichment_start_ts = time.time()
-                        logger.info("富集: 气压 %.1f Pa 已到达目标 %.1f Pa (±%.0f Pa)，开始计时 %.0f s",
+                        self._enrichment_fill_time = self.enrichment_start_ts - self._enrichment_begin_ts
+                        # 只把“显示的目标气压”对齐到富集目标，不写入 STM32；
+                        # 真实控制仍由渐变小步接管，避免设定值跳变造成阀门冲量超调
+                        self._enrichment_display_target = self.enrichment_target
+                        self.current_target = self.enrichment_target
+                        logger.info("富集: 气压 %.1f Pa 已到达目标 %.1f Pa 区间（≥%.0f Pa），开始计时 %.0f s（补气耗时 %.1f 秒）",
                                     filtered, self.enrichment_target,
-                                    ENRICHMENT_PRESSURE_TOLERANCE, self.enrichment_duration)
+                                    self.enrichment_target - ENRICHMENT_PRESSURE_TOLERANCE,
+                                    self.enrichment_duration, self._enrichment_fill_time)
                     else:
                         now = time.time()
-                        # 两段式渐变补气
-                        if self.enrichment_ramp_step > 0 and filtered < self.enrichment_target:
-                            remaining = self.enrichment_target - self._enrichment_ramp_current
-                            if remaining > self._enrichment_fine_switch:
-                                # 大段阶段：单向确认——气压到达当前阶梯下方 500 Pa 以内，
-                                # 或已冲过该阶梯，即进入下一级（大步长不会卡在中间值）
-                                if filtered >= self._enrichment_ramp_current - ENRICHMENT_PRESSURE_TOLERANCE:
-                                    self._advance_ramp(
-                                        min(self.enrichment_target,
-                                            self._enrichment_ramp_current + self.enrichment_ramp_step,
-                                            # 粗调最多推进到“目标 - 精调切换余量”，
-                                            # 避免大步长直接跨过精调区导致最后一步超调
-                                            self.enrichment_target - self._enrichment_fine_switch)
-                                    )
-                            else:
-                                # 精调阶段：等压爬升——气压真正进入当前阶梯 ±500 Pa 才进下一级，
-                                # 保证接近目标时阀门开度小、无冲量，避免超调
-                                if abs(filtered - self._enrichment_ramp_current) <= ENRICHMENT_PRESSURE_TOLERANCE:
-                                    self._advance_ramp(
-                                        min(self.enrichment_target,
-                                            self._enrichment_ramp_current + self._enrichment_fine_step)
-                                    )
+                        # 补气：默认策略走写死的参考点阶梯，手动步长走三段式渐变
+                        next_r = self._ramp_next_target(filtered, flow=_flow)
+                        if next_r is not None:
+                            self._advance_ramp(next_r)
                         if now - last_wait_log >= 30.0:
                             logger.info("富集: 等待气压到达目标，当前 %.1f Pa / 目标 %.1f Pa (渐变目标 %.1f Pa)",
                                         filtered, self.enrichment_target, self._enrichment_ramp_current)
@@ -556,7 +788,19 @@ class ControlContext:
                 time.sleep(0.5)
                 continue
 
-            # 阶段 2：到达目标后倒计时，结束自动设置 100000 Pa
+            # 阶段 2：到达目标后倒计时；真实控制的渐变若还没走完，继续收尾到目标
+            if self._enrichment_ramp_current < self.enrichment_target:
+                try:
+                    if self.current_filtered >= self.enrichment_target:
+                        # 实际已到/冲过目标：直接把真实目标对齐（阀门本就该关，不会额外进气）
+                        self._advance_ramp(self.enrichment_target, update_display=False)
+                    else:
+                        next_r = self._ramp_next_target(self.current_filtered, flow=self.current_flow_cmd)
+                        if next_r is not None:
+                            self._advance_ramp(next_r, update_display=False)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("富集: 收尾渐变推进失败: %s", e)
+
             remaining = self.enrichment_remaining()
             if remaining > 0:
                 time.sleep(min(0.2, remaining))
@@ -565,6 +809,7 @@ class ControlContext:
             if self._modbus_cli is None:
                 logger.error("富集结束时 STM32 串口未打开，无法设置目标气压，请手动设置")
                 self.enrichment_active = False
+                self._enrichment_quick_profile = None
                 continue
 
             # 结束动作：确保控制模式。
@@ -615,6 +860,7 @@ class ControlContext:
                         self.current_target = 100000.0
                         self._enrichment_venting = False
                         self.enrichment_active = False
+                        self._enrichment_quick_profile = None
                         fail_count = 0
                         logger.info("富集检测模式结束（超时收阀），目标气压已设置为 100000 Pa")
                     except Exception as e:  # noqa: BLE001
@@ -634,6 +880,7 @@ class ControlContext:
                         self.current_target = 100000.0
                         self._enrichment_venting = False
                         self.enrichment_active = False
+                        self._enrichment_quick_profile = None
                         fail_count = 0
                         logger.info("富集检测模式结束，目标气压已设置为 100000 Pa")
                         # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
@@ -661,6 +908,7 @@ class ControlContext:
                 self._modbus_cli.write_target_pressure(100000.0)
                 self.current_target = 100000.0
                 self.enrichment_active = False
+                self._enrichment_quick_profile = None
                 fail_count = 0
                 logger.info("富集检测模式结束，目标气压已自动设置为 100000 Pa")
                 # 自动记录一条日志（若远程 raw 已打开则会刷新质谱）
@@ -678,6 +926,41 @@ class ControlContext:
                     except Exception as re:  # noqa: BLE001
                         logger.error("复位串口失败: %s", re)
                 time.sleep(2.0)
+
+    # ---- 污染物检测 ----
+    def _detection_loop(self):
+        """后台线程：只负责检测规则文件的自动重载（不轮询 MS，数据由曲线增量接口喂入）。"""
+        while not self._detection_stop.is_set():
+            try:
+                # 规则文件自动重载（VSCode 保存后无需重启）
+                try:
+                    mtime = os.path.getmtime(DETECTIONS_PATH)
+                    if mtime != self._detection_rules_mtime:
+                        n = self.detector.load_from_file(DETECTIONS_PATH)
+                        self._detection_rules_mtime = mtime
+                        logger.info("检测规则已重载: %d 条", n)
+                except OSError:
+                    pass
+            except Exception as e:  # noqa: BLE001
+                logger.error("检测线程异常: %s", e)
+            time.sleep(5)
+
+    def _append_detection_log(self, ev: Dict[str, Any]) -> None:
+        try:
+            os.makedirs("data", exist_ok=True)
+            log_path = os.path.join("data", "detections_log.csv")
+            is_new = not os.path.exists(log_path)
+            with self._detection_csv_lock:
+                with open(log_path, "a", newline="", encoding="utf-8") as fh:
+                    writer = csv.writer(fh)
+                    if is_new:
+                        writer.writerow(["timestamp", "name", "mass_range", "intensity", "threshold"])
+                    writer.writerow([
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["time"])),
+                        ev["name"], ev["mass_range"], ev["intensity"], ev["threshold"],
+                    ])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("写入检测日志失败: %s", e)
 
     # ---- 控制线程 ----
     def start_control(self):
@@ -699,6 +982,47 @@ class ControlContext:
         self._thread.start()
 
     # ---- 数据快照保存 ----
+    def _begin_pressure_log_session(self) -> None:
+        """开启新的气压记录会话：下次写入自动新建独立文件（按天归档）。"""
+        self._pressure_log_session = True
+        self._pressure_log_session_start = time.time()
+        self._pressure_log_path = None
+        self._pressure_log_last_ts = 0.0
+
+    def _append_pressure_log(self, filtered: float, air: int, target: float, real_target: float,
+                             flow_cmd: float, now_ts: float) -> None:
+        """自动记录气压数据：每次实验一个文件，按天归档。
+
+        文件路径: data/pressure_logs/YYYYMMDD/pressure_YYYYMMDD_HHMMSS.csv
+        target = 显示/设定目标（界面看到的值）；real_target = STM32 实际控制目标（含阶梯/早关点）。
+        """
+        try:
+            if self._pressure_log_path is None:
+                day = time.strftime("%Y%m%d", time.localtime(now_ts))
+                sess = time.strftime("%Y%m%d_%H%M%S", time.localtime(now_ts)) + \
+                    f"_{int(now_ts % 1 * 1000):03d}"
+                log_dir = os.path.join("data", "pressure_logs", day)
+                os.makedirs(log_dir, exist_ok=True)
+                self._pressure_log_path = os.path.join(log_dir, f"pressure_{sess}.csv")
+            log_path = self._pressure_log_path
+            is_new = not os.path.exists(log_path)
+            with self._pressure_log_lock:
+                with open(log_path, "a", newline="", encoding="utf-8") as fh:
+                    writer = csv.writer(fh)
+                    if is_new:
+                        writer.writerow([
+                            "timestamp", "unix_time", "filtered_pressure",
+                            "air_pressure", "target_pressure", "real_target_pressure", "mfc_opening",
+                        ])
+                    writer.writerow([
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+                        f"{now_ts:.3f}", f"{filtered:.1f}", air,
+                        f"{target:.1f}", f"{real_target:.1f}", f"{flow_cmd:.6f}",
+                    ])
+            self._pressure_log_path = log_path
+        except Exception as e:  # noqa: BLE001
+            logger.warning("写入气压日志失败: %s", e)
+
     def save_snapshot(self):
         """将当前内存中的历史数据一次性写入 CSV 文件。
 
@@ -744,7 +1068,12 @@ class ControlContext:
                 filtered, air, target, flow_cmd, start_pid = self._modbus_cli.read_all_states()
                 self.current_filtered = filtered
                 self.current_air = air
-                self.current_target = target
+                # 富集到达/稳定确认后：显示目标对齐富集目标（不做真实控制），真实控制仍由 STM32 渐变目标接管
+                if (self.enrichment_active and not self._enrichment_venting
+                        and self._enrichment_display_target is not None):
+                    self.current_target = self._enrichment_display_target
+                else:
+                    self.current_target = target
                 self.current_flow_cmd = flow_cmd
                 self.current_start_pid = start_pid
 
@@ -756,6 +1085,21 @@ class ControlContext:
                                  filtered, air, target, flow_cmd, start_pid,
                                  self._modbus_cli.consecutive_errors)
                     last_health_log = now
+
+                # 自动记录气压数据（按设定间隔，0 = 每个采样点都记；停止控制后不再追加）
+                if self.auto_log and self._pressure_log_session:
+                    # 定时模式：到时自动停止本次记录（轮询继续，仅不再追加）
+                    if self.auto_log_mode == "timed" and self.auto_log_duration > 0:
+                        if time.time() - self._pressure_log_session_start >= self.auto_log_duration:
+                            self._pressure_log_session = False
+                            logger.info("气压自动记录已到设定时长(%.0f 秒)，自动停止", self.auto_log_duration)
+                    if self._pressure_log_session:
+                        log_ts = time.time()
+                        if self.auto_log_interval <= 0 or log_ts - self._pressure_log_last_ts >= self.auto_log_interval:
+                            # 同时记录“显示/设定目标”和“真实控制目标（STM32 实际收到，含阶梯/早关点）”
+                            self._append_pressure_log(
+                                filtered, air, self.current_target, target, flow_cmd, log_ts)
+                            self._pressure_log_last_ts = log_ts
 
             except Exception as e:
                 cons_err = self._modbus_cli.consecutive_errors if self._modbus_cli else -1
@@ -834,11 +1178,13 @@ class ControlContext:
                 "active": self.enrichment_active,
                 "reached": self.enrichment_reached,
                 "venting": self._enrichment_venting,
+                "fill_time": self._enrichment_fill_time,
                 "target": self.enrichment_target,
                 "duration": self.enrichment_duration,
                 "remaining": self.enrichment_remaining(),
                 "ramp_step": self.enrichment_ramp_step,
                 "ramp_current": self._enrichment_ramp_current,
+                "quick": self._enrichment_quick_profile is not None,
             },
             "comm": {
                 "open": bool(self._modbus_cli and self._modbus_cli._ser and self._modbus_cli._ser.is_open),
@@ -853,11 +1199,20 @@ class ControlContext:
                 "out_max": self.pid_out_max,
             },
         }
+        # 取出待推送的检测事件（由检测线程放入队列，避免多线程直接操作 WS）
+        events = []
+        while True:
+            try:
+                events.append(self._detection_events.get_nowait())
+            except queue.Empty:
+                break
         async with self._ws_lock:
             dead = []
             for ws in self._ws_clients:
                 try:
                     await ws.send_json(data)
+                    for ev in events:
+                        await ws.send_json(ev)
                 except Exception:
                     dead.append(ws)
             for ws in dead:
@@ -952,6 +1307,21 @@ class MsCurvesBody(BaseModel):
     eics: List[Dict[str, Any]] = []  # [{"mass_range": "...", "intensity": [...]}]
 
 
+class DetectionBody(BaseModel):
+    name: Optional[str] = ""  # 可留空，留空时以 m/z 范围作为标识
+    mass_range: str
+    threshold: float
+    enabled: Optional[bool] = True
+    cooldown_s: Optional[float] = 60.0
+
+
+class PressureLogBody(BaseModel):
+    enabled: bool
+    interval: Optional[float] = None  # 记录间隔（秒），0 = 每个采样点都记录
+    mode: Optional[str] = None  # manual=手动停止, timed=定时停止
+    duration: Optional[float] = None  # 定时模式时长（秒）
+
+
 @app.post("/api/reload-pid")
 async def api_reload_pid():
     """从配置文件重新加载 PID 参数并写入 STM32。
@@ -1010,15 +1380,23 @@ async def get_state():
         "stm32": {"port": ctx.stm32_port, "baud": ctx.stm32_baud, "addr": ctx.stm32_addr},
         "monitor_only": ctx.current_start_pid == 0,
         "history_window": ctx.history_window,
+        "auto_log": ctx.auto_log,
+        "auto_log_interval": ctx.auto_log_interval,
+        "auto_log_mode": ctx.auto_log_mode,
+        "auto_log_duration": ctx.auto_log_duration,
+        "pressure_log_active": ctx._pressure_log_session,
+        "pressure_log_path": ctx._pressure_log_path,
         "enrichment": {
             "active": ctx.enrichment_active,
             "reached": ctx.enrichment_reached,
             "venting": ctx._enrichment_venting,
+            "fill_time": ctx._enrichment_fill_time,
             "target": ctx.enrichment_target,
             "duration": ctx.enrichment_duration,
             "remaining": ctx.enrichment_remaining(),
             "ramp_step": ctx.enrichment_ramp_step,
             "ramp_current": ctx._enrichment_ramp_current,
+            "quick": ctx._enrichment_quick_profile is not None,
         },
         "comm": {
             "open": bool(ctx._modbus_cli and ctx._modbus_cli._ser and ctx._modbus_cli._ser.is_open),
@@ -1075,11 +1453,13 @@ async def api_enrichment_start(body: EnrichmentBody):
             "active": ctx.enrichment_active,
             "reached": ctx.enrichment_reached,
             "venting": ctx._enrichment_venting,
+            "fill_time": ctx._enrichment_fill_time,
             "target": ctx.enrichment_target,
             "duration": ctx.enrichment_duration,
             "remaining": ctx.enrichment_remaining(),
             "ramp_step": ctx.enrichment_ramp_step,
             "ramp_current": ctx._enrichment_ramp_current,
+            "quick": ctx._enrichment_quick_profile is not None,
         },
     }
 
@@ -1222,8 +1602,11 @@ async def api_ms_fs_roots(body: MsFsRootsBody):
     if host.startswith("https://"):
         host = host[len("https://") :]
     base_url = f"http://{host}:8899"
-    resp = await asyncio.to_thread(_ms_http_post_json, base_url, "/api/fs/roots", {})
-    return resp
+    try:
+        resp = await asyncio.to_thread(_ms_http_post_json, base_url, "/api/fs/roots", {})
+        return resp
+    except Exception as e:  # noqa: BLE001
+        return _ms_proxy_error(e)
 
 
 @app.post("/api/ms-fs-list")
@@ -1240,8 +1623,11 @@ async def api_ms_fs_list(body: MsFsListBody):
     if host.startswith("https://"):
         host = host[len("https://") :]
     base_url = f"http://{host}:8899"
-    resp = await asyncio.to_thread(_ms_http_post_json, base_url, "/api/fs/list", {"path": path})
-    return resp
+    try:
+        resp = await asyncio.to_thread(_ms_http_post_json, base_url, "/api/fs/list", {"path": path})
+        return resp
+    except Exception as e:  # noqa: BLE001
+        return _ms_proxy_error(e)
 
 
 @app.post("/api/ms-open")
@@ -1338,6 +1724,23 @@ async def api_ms_curves_append(body: MsCurvesBody):
                         writer.writerow([f"{t:.4f}", label, f"{v}"])
                     rows += len(times)
     logger.info("已追加 %d 行质谱曲线数据到 %s", rows, ctx._ms_curve_file)
+
+    # 把本次增量数据喂给检测器（复用前端已拉取的曲线，避免单独轮询 MS 造成双重刷新）
+    try:
+        now_ts = time.time()
+        events: List[Dict[str, Any]] = []
+        if body.tic:
+            events += ctx.detector.evaluate("50-500", list(body.tic), now_ts)
+        for e in body.eics:
+            events += ctx.detector.evaluate(str(e.get("mass_range", "")), list(e.get("intensity") or []), now_ts)
+        for ev in events:
+            ctx._append_detection_log(ev)
+            ctx._detection_events.put(ev)
+            logger.warning("检测命中: %s (强度 %.0f / 阈值 %.0f)",
+                           ev["name"], ev["intensity"], ev["threshold"])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("检测数据喂入失败: %s", e)
+
     return {"ok": True, "saved": rows}
 
 
@@ -1487,7 +1890,7 @@ async def api_ms_chro(body: MsChroBody):
             "intensity": intensity_list,
         }
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"调用 MSHTTPFastAPI 出错: {e}"}
+        return _ms_proxy_error(e)
 
 
 @app.post("/api/ms-chro-lite")
@@ -1660,6 +2063,81 @@ async def api_logs_recent(lines: int = 80, level: str = "all"):
     except Exception as e:  # noqa: BLE001
         logger.error("读取日志失败: %s", e)
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/detections")
+async def api_detections_list():
+    """返回全部污染物检测规则。"""
+    return {"ok": True, "rules": ctx.detector.get_rules()}
+
+
+@app.post("/api/detections")
+async def api_detections_upsert(body: DetectionBody):
+    """新增或更新一条检测规则，并写回规则文件。"""
+    rule = {
+        "name": (body.name or "").strip(),
+        "mass_range": body.mass_range.strip(),
+        "threshold": float(body.threshold),
+        "enabled": bool(body.enabled if body.enabled is not None else True),
+        "cooldown_s": float(body.cooldown_s if body.cooldown_s is not None else 60.0),
+    }
+    ctx.detector.upsert_rule(rule)
+    ctx.detector.save_to_file(DETECTIONS_PATH)
+    return {"ok": True, "rules": ctx.detector.get_rules()}
+
+
+@app.delete("/api/detections/{key}")
+async def api_detections_delete(key: str):
+    """删除一条检测规则。"""
+    existed = ctx.detector.delete_rule(key)
+    if existed:
+        ctx.detector.save_to_file(DETECTIONS_PATH)
+    return {"ok": existed, "rules": ctx.detector.get_rules()}
+
+
+@app.post("/api/detections/reload")
+async def api_detections_reload():
+    """从规则文件重新加载（VSCode 编辑保存后手动触发；也可自动重载）。"""
+    n = ctx.detector.load_from_file(DETECTIONS_PATH)
+    return {"ok": True, "count": n, "rules": ctx.detector.get_rules()}
+
+
+@app.post("/api/pressure-log")
+async def api_pressure_log(body: PressureLogBody):
+    """开关/调整自动记录气压数据。"""
+    ctx.auto_log = bool(body.enabled)
+    if body.interval is not None and body.interval >= 0:
+        ctx.auto_log_interval = float(body.interval)
+    if body.mode in ("manual", "timed"):
+        ctx.auto_log_mode = body.mode
+    if body.duration is not None and body.duration >= 0:
+        ctx.auto_log_duration = float(body.duration)
+    logger.info("自动记录气压数据: enabled=%s interval=%.1fs", ctx.auto_log, ctx.auto_log_interval)
+    return {
+        "ok": True,
+        "auto_log": ctx.auto_log,
+        "auto_log_interval": ctx.auto_log_interval,
+        "auto_log_mode": ctx.auto_log_mode,
+        "auto_log_duration": ctx.auto_log_duration,
+        "pressure_log_active": ctx._pressure_log_session,
+        "path": ctx._pressure_log_path,
+    }
+
+
+@app.post("/api/pressure-log/start")
+async def api_pressure_log_start():
+    """手动开始气压记录（新文件；记录与开始控制/仅检测/富集无关，由用户独立控制）。"""
+    ctx._begin_pressure_log_session()
+    logger.info("手动开始气压记录")
+    return {"ok": True, "pressure_log_active": True, "path": ctx._pressure_log_path}
+
+
+@app.post("/api/pressure-log/stop")
+async def api_pressure_log_stop():
+    """手动停止气压记录（轮询/显示继续，仅不再追加数据）。"""
+    ctx._pressure_log_session = False
+    logger.info("手动停止气压记录")
+    return {"ok": True, "pressure_log_active": False, "path": ctx._pressure_log_path}
 
 
 @app.websocket("/ws/pressure")

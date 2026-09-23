@@ -1,0 +1,26 @@
+{
+  "rules": [
+    {
+      "name": "示例-丙酮",
+      "mass_range": "58-59",
+      "threshold": 50000.0,
+      "enabled": false,
+      "cooldown_s": 60.0,
+      "min_duration_s": null,
+      "baseline_ratio": null,
+      "rt_window": null,
+      "extra": {}
+    },
+    {
+      "name": "丙酮",
+      "mass_range": "58-59",
+      "threshold": 10000.0,
+      "enabled": true,
+      "cooldown_s": 60.0,
+      "min_duration_s": null,
+      "baseline_ratio": null,
+      "rt_window": null,
+      "extra": {}
+    }
+  ]
+}
